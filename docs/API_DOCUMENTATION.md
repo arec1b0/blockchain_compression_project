@@ -61,17 +61,21 @@ The `StateDelta` class handles the storage and management of state changes (delt
 #### **Methods:**
 
 ##### `apply_transaction(self, transaction: dict) -> dict`
-- **Description**: Applies a transaction to the blockchain state and stores only the delta (difference).
+- **Description**: Applies a transaction to the blockchain state and stores only the delta (difference). Application is **idempotent**: replaying a transaction with an already-applied `tx_id` is a no-op and returns an empty dict.
 - **Parameters**: 
   - `transaction` (dict): A dictionary representing the transaction to apply. Must contain the keys:
-    - `account`: The account to update.
-    - `amount`: The change to apply to the account.
+    - `tx_id`: A unique, non-empty string identifying the transaction (used for replay protection).
+    - `account`: The account to update (non-empty string).
+    - `amount`: The numeric change to apply to the account.
 - **Returns**: 
-  - A dictionary representing the delta (difference) applied to the state.
+  - A dictionary representing the delta (difference) applied to the state, or `{}` if the transaction was already applied.
+- **Raises**: `TypeError` / `ValueError` if the transaction is malformed.
 - **Example**:
   ```python
+  from blockchain_compression.compression import StateDelta
+
   state_delta = StateDelta()
-  delta = state_delta.apply_transaction({'account': 'Alice', 'amount': 100})
+  delta = state_delta.apply_transaction({'tx_id': 'tx-001', 'account': 'Alice', 'amount': 100})
   ```
 
 ##### `get_current_state(self) -> dict`
@@ -91,39 +95,63 @@ The `StateDelta` class handles the storage and management of state changes (delt
 
 ### **MerkleTree**
 
-The `MerkleTree` class is responsible for constructing a Merkle tree from a list of transactions and providing the root hash for verifying the integrity of those transactions.
+The `MerkleTree` class constructs a Merkle tree from a list of transactions and provides the root hash plus per-transaction inclusion proofs. Leaf and internal-node hashes are domain-separated (`0x00` / `0x01` prefixes, as in RFC 6962), and unpaired nodes are promoted rather than duplicated, so different transaction sets cannot collide on the same root.
 
 #### **Methods:**
 
 ##### `__init__(self, transactions: list)`
-- **Description**: Initializes a Merkle tree from a list of transactions.
+- **Description**: Initializes a Merkle tree from a list of transactions. An empty list is allowed and produces a tree with root `None`.
 - **Parameters**: 
   - `transactions` (list): A list of transaction strings.
+- **Raises**: `TypeError` if `transactions` is not a list of strings.
 - **Example**:
   ```python
+  from blockchain_compression.merkle import MerkleTree
+
   merkle_tree = MerkleTree(["tx1", "tx2", "tx3", "tx4"])
   ```
 
-##### `get_root(self) -> str`
-- **Description**: Returns the root hash of the Merkle tree.
+##### `get_root(self) -> str | None`
+- **Description**: Returns the root hash of the Merkle tree, or `None` for an empty tree.
 - **Parameters**: 
   - None.
 - **Returns**: 
-  - The root hash as a string.
+  - The root hash as a hex string, or `None`.
 - **Example**:
   ```python
   root_hash = merkle_tree.get_root()
   ```
 
-##### `hash_data(self, data: str) -> str`
-- **Description**: Returns the SHA-256 hash of the given data.
+##### `get_proof(self, index: int) -> list`
+- **Description**: Returns the inclusion proof for the transaction at `index`.
 - **Parameters**: 
-  - `data` (str): The data to hash.
+  - `index` (int): Position of the transaction in the original list.
 - **Returns**: 
-  - A string representing the SHA-256 hash of the input data.
+  - A list of proof steps `{"hash": <hex digest>, "position": "left" | "right"}`, where `position` is the side of the sibling hash.
+- **Raises**: `IndexError` if `index` is out of range.
 - **Example**:
   ```python
-  hashed_data = merkle_tree.hash_data("tx1")
+  proof = merkle_tree.get_proof(2)
+  ```
+
+##### `verify_proof(cls, transaction: str, proof: list, root: str) -> bool`
+- **Description**: Classmethod. Verifies that `transaction` is committed under `root` using `proof`. Does not require the full tree.
+- **Parameters**: 
+  - `transaction` (str): The transaction to verify.
+  - `proof` (list): Proof steps produced by `get_proof`.
+  - `root` (str): The expected root hash.
+- **Returns**: 
+  - `True` if the proof is valid, `False` otherwise.
+- **Example**:
+  ```python
+  assert MerkleTree.verify_proof("tx3", proof, root_hash)
+  ```
+
+##### `hash_leaf(data: str) -> str` / `hash_node(left: str, right: str) -> str`
+- **Description**: Static hashing primitives. `hash_leaf` hashes a transaction as a leaf (`0x00`-prefixed SHA-256); `hash_node` hashes two child digests as an internal node (`0x01`-prefixed SHA-256).
+- **Example**:
+  ```python
+  leaf = MerkleTree.hash_leaf("tx1")
   ```
 
 ---
@@ -200,13 +228,13 @@ The `ZKSnark` class is a placeholder for implementing Zero-Knowledge Succinct No
   is_valid = zk.verify_proof(proof, {"account": "Alice", "balance": 100})
   ```
 
-##### `hash_data(self, data: str) -> str`
-- **Description**: A placeholder for a cryptographic hash function used to create a proof. Returns the SHA-256 hash of the data.
+##### `hash_data(data: dict) -> str`
+- **Description**: Static method. Returns the SHA-256 hash of a canonical JSON encoding of the data, so dictionary key order cannot change the hash.
 - **Parameters**: 
-  - `data` (str): The data to be hashed.
+  - `data` (dict): The data to be hashed.
 - **Returns**: 
-  - A string representing the SHA-256 hash of the input data.
+  - A string representing the SHA-256 hash of the canonical encoding.
 - **Example**:
   ```python
-  hashed_data = zk.hash_data("sample data")
+  hashed_data = ZKSnark.hash_data({"account": "Alice", "balance": 100})
   ```

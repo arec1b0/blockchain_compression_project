@@ -1,7 +1,5 @@
-# requirements.txt
-
-# LZMA for block compression (built into Python standard library)
-# No need to install separately
-
-# Testing framework
+# Runtime dependencies: none — the project uses only the Python standard library.
+# Development dependencies (also installable via `pip install -e .[dev]`):
 pytest
+ruff
+build

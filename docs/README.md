@@ -17,13 +17,11 @@ The **Blockchain Compression Project** is designed to optimize blockchain data s
 ### Getting Started
 
 #### Prerequisites
-- **Python**: Version 3.6 or higher
-- **Required Libraries**: While the project relies heavily on Python’s standard libraries, ensure that `pytest` is installed for development and testing purposes.
-
-You can install the required packages by running:
+- **Python**: Version 3.10 or higher
+- **Required Libraries**: The project itself relies only on Python's standard library. Development tools (`pytest`, `ruff`, `build`) are installed as the `dev` extra:
 
 ```bash
-pip install -r requirements.txt
+pip install -e .[dev]
 ```
 
 ---
@@ -50,6 +48,11 @@ pip install -r requirements.txt
    blockchain-compress
    ```
 
+5. To run the compression benchmark (compression ratio and throughput across datasets and LZMA presets):
+   ```bash
+   blockchain-compress-bench
+   ```
+
 ---
 
 ### Usage
@@ -62,10 +65,10 @@ Once installed, you can run the project to simulate blockchain compression and m
 4. **Blockchain Pruning**: Removes outdated blocks, retaining only the most recent ones.
 5. **ZK-SNARKs**: Demonstrates proof generation and verification using zero-knowledge proof concepts.
 
-To run the system, you can execute the `main.py` file:
+To run the system, execute the demo module (or the `blockchain-compress` console script):
 
 ```bash
-python src/main.py
+python -m blockchain_compression.main
 ```
 
 ---
@@ -78,21 +81,25 @@ After running the program, you should see outputs demonstrating various componen
 === Blockchain Data Compression and Management ===
 
 --- Block Compression ---
-Original block data: b'Sample blockchain block data'
-Compressed block data: b'\xfd7zXZ\x00\x00\x04...'
+Original block data: b'Sample blockchain block data' (28 bytes)
+Compressed size: 84 bytes
 Decompressed block data: b'Sample blockchain block data'
 
 --- State Delta Storage ---
+Transaction tx-001 already applied; ignoring replay.
 Current state: {'Alice': 100, 'Bob': 50}
 
 --- Merkle Tree Verification ---
-Merkle Tree root hash: 5e3229cc92783d3338f52205539346f83a73c96b208958cf7259809f393577c1
+Merkle Tree root hash: dc53b6c71a68a3277479b5a1ea820eb52bbae145ef8fb4e97a414b2b6c670f7f
+Inclusion proof for 'tx3': [{'hash': '590b66ca...', 'position': 'right'}, {'hash': '60e1f5f6...', 'position': 'left'}]
+Proof verifies: True
 
 --- Blockchain Pruning ---
+Pruned 1 old block(s); keeping the last 2.
 Blocks after pruning: [{'block_number': 2, 'data': 'Block 2 data'}, {'block_number': 3, 'data': 'Block 3 data'}]
 
---- ZK-SNARK Proof Generation and Verification ---
-Generated proof: {'proof': 'zk-snark-proof-placeholder', 'data_hash': '3b18ffb6b8912fdef...'}
+--- ZK-SNARK Proof Generation and Verification (mock) ---
+Generated proof: {'proof': 'zk-snark-proof-placeholder', 'data_hash': 'd9e9b468...'}
 Proof verification result: True
 ```
 

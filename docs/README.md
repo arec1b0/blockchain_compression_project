@@ -30,7 +30,7 @@ pip install -e .[dev]
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/dkrizhanovskyi/blockchain_compression_project.git
+   git clone https://github.com/arec1b0/blockchain_compression_project.git
    ```
 
 2. Navigate to the project directory:

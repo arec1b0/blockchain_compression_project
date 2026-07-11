@@ -30,7 +30,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/dkrizhanovskyi/blockchain_compression_project"
+Homepage = "https://github.com/arec1b0/blockchain_compression_project"
 
 [project.scripts]
 blockchain-compress = "blockchain_compression.main:main"

@@ -17,12 +17,20 @@ The **Blockchain Compression Project** is designed to optimize blockchain data s
 ### Getting Started
 
 #### Prerequisites
-- **Python**: Version 3.10 or higher
-- **Required Libraries**: The project itself relies only on Python's standard library. Development tools (`pytest`, `ruff`, `build`) are installed as the `dev` extra:
+- **Python**: Version 3.10 or higher (uv installs it for you if missing)
+- **[uv](https://docs.astral.sh/uv/)**: the project is managed entirely with uv — install it with
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+  (on Windows: `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`)
+- **Required Libraries**: The project itself relies only on Python's standard library. Development
+  tools are declared in [PEP 735](https://peps.python.org/pep-0735/) `dependency-groups`:
 
-```bash
-pip install -e .[dev]
-```
+  | Group  | Contents                | Purpose                    |
+  | ------ | ----------------------- | -------------------------- |
+  | `test` | `pytest`, `pytest-cov`  | Test suite and coverage    |
+  | `lint` | `ruff`                  | Linting and import sorting |
+  | `dev`  | `test` + `lint`         | Default local environment  |
 
 ---
 
@@ -38,19 +46,26 @@ pip install -e .[dev]
    cd blockchain_compression_project
    ```
 
-3. Install the necessary dependencies:
+3. Create the virtual environment and install the project with its `dev` group
+   (`dev` is the default group, so no flag is needed):
    ```bash
-   pip install .
+   uv sync
+   ```
+
+   To install only what a single task needs:
+   ```bash
+   uv sync --only-group test     # just pytest + pytest-cov
+   uv sync --no-default-groups   # runtime only, no dev tooling
    ```
 
 4. To run the project using the command-line interface (CLI):
    ```bash
-   blockchain-compress
+   uv run blockchain-compress
    ```
 
 5. To run the compression benchmark (compression ratio and throughput across datasets and LZMA presets):
    ```bash
-   blockchain-compress-bench
+   uv run blockchain-compress-bench
    ```
 
 ---
@@ -68,7 +83,7 @@ Once installed, you can run the project to simulate blockchain compression and m
 To run the system, execute the demo module (or the `blockchain-compress` console script):
 
 ```bash
-python -m blockchain_compression.main
+uv run python -m blockchain_compression.main
 ```
 
 ---
@@ -114,7 +129,19 @@ If you want to contribute to the project or run tests, follow the steps below.
 We use **pytest** for testing. To run all tests, use the following command:
 
 ```bash
-pytest
+uv run pytest
+```
+
+With coverage:
+
+```bash
+uv run pytest --cov=src
+```
+
+Linting is handled by **ruff** (`lint` group):
+
+```bash
+uv run ruff check .
 ```
 
 The tests ensure that each module functions correctly, covering block compression, state delta application, Merkle tree integrity, blockchain pruning, and ZK-SNARK proof verification.

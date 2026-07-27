@@ -28,34 +28,59 @@ Please ensure your contributions align with the goals of the project (i.e., enha
 
 ## Setting up the Development Environment
 
-1. **Clone the repository**:
+This project uses **[uv](https://docs.astral.sh/uv/)** for environments, dependencies, and packaging.
+There is no `requirements.txt` and no `pip install` step — everything goes through `uv`.
+
+1. **Install uv** (once per machine):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+   On Windows:
+   ```bash
+   powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+
+2. **Clone the repository**:
    ```bash
    git clone https://github.com/arec1b0/blockchain_compression_project.git
    cd blockchain_compression_project
    ```
 
-2. **Create a virtual environment** (optional but recommended):
+3. **Create the environment and install everything**:
+   `uv sync` creates `.venv/`, installs the project in editable mode, and installs the default
+   `dev` dependency group. It also pins the interpreter from `.python-version` (installing it if
+   needed), so you never create a venv by hand:
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   uv sync
    ```
 
-3. **Install the dependencies**:
-   Install the required packages by running:
+4. **Run tests** to make sure everything is set up correctly:
    ```bash
-   pip install -e .
+   uv run pytest
    ```
 
-4. **Install development dependencies**:
-   If you're planning to run tests or make changes to the code, install additional dependencies with:
-   ```bash
-   pip install -r requirements.txt
-   ```
+#### Dependency groups
 
-5. **Run tests** to make sure everything is set up correctly:
-   ```bash
-   pytest
-   ```
+Development tooling is split into [PEP 735](https://peps.python.org/pep-0735/) `dependency-groups`
+in `pyproject.toml`, not into extras:
+
+| Group  | Contents               | Install with                |
+| ------ | ---------------------- | --------------------------- |
+| `test` | `pytest`, `pytest-cov` | `uv sync --only-group test` |
+| `lint` | `ruff`                 | `uv sync --only-group lint` |
+| `dev`  | `test` + `lint`        | `uv sync` (default)         |
+
+Useful commands:
+
+```bash
+uv sync --no-default-groups   # runtime only, no dev tooling
+uv add --group test <package> # add a new test dependency
+uv lock --upgrade             # refresh uv.lock
+uv build                      # build sdist + wheel into dist/
+```
+
+`uv.lock` is committed and must be kept in sync with `pyproject.toml` — CI runs
+`uv sync --locked` and fails if the lockfile is stale. Commit it alongside any dependency change.
 
 ---
 
@@ -92,7 +117,7 @@ Before submitting changes, make sure that all tests pass successfully. We use **
 
 1. Run the full test suite with:
    ```bash
-   pytest
+   uv run pytest
    ```
 
 2. Make sure to write new tests for any new functionality or bug fixes:
@@ -104,7 +129,7 @@ Before submitting changes, make sure that all tests pass successfully. We use **
    - Ensure the code you contribute is well-tested to maintain or improve the current level of test coverage.
    - You can check code coverage by running:
      ```bash
-     pytest --cov=src
+     uv run pytest --cov=src
      ```
 
 ---

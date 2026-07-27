@@ -5,8 +5,12 @@ __pycache__/
 *.pyd
 
 # Virtual environment
+.venv/
 venv/
 env/
+
+# uv (uv.lock is committed on purpose)
+.uv_cache/
 
 # Distribution / packaging
 .Python

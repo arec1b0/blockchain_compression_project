@@ -8,6 +8,7 @@ corrupt the state.
 """
 
 import logging
+from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,13 @@ class StateDelta:
         self._applied_tx_ids = set()
 
     @staticmethod
-    def _validate_transaction(transaction) -> None:
+    def validate_transaction(transaction) -> None:
+        """Raise ``TypeError``/``ValueError`` if ``transaction`` is malformed.
+
+        Public so callers (e.g. ``Chain.add_block``) can pre-validate a whole
+        batch of transactions before applying any of them, avoiding a
+        partially-applied batch when a later transaction turns out invalid.
+        """
         if not isinstance(transaction, dict):
             raise TypeError(f"transaction must be a dict, got {type(transaction).__name__}")
         missing = [field for field in _REQUIRED_FIELDS if field not in transaction]
@@ -43,7 +50,7 @@ class StateDelta:
         ``account`` and ``amount``. Returns ``{account: new_balance}``, or an
         empty dict when the transaction was already applied (idempotent replay).
         """
-        self._validate_transaction(transaction)
+        self.validate_transaction(transaction)
         tx_id = transaction["tx_id"]
         if tx_id in self._applied_tx_ids:
             logger.warning("Transaction %s already applied; ignoring replay.", tx_id)
@@ -57,3 +64,20 @@ class StateDelta:
     def get_current_state(self) -> dict:
         """Return a copy of the full current state (account -> balance)."""
         return dict(self.current_state)
+
+    def get_applied_tx_ids(self) -> frozenset:
+        """Return the set of transaction IDs already applied (replay-protection state)."""
+        return frozenset(self._applied_tx_ids)
+
+    @classmethod
+    def from_snapshot(cls, state: dict, applied_tx_ids: Iterable[str]) -> "StateDelta":
+        """Rehydrate a ``StateDelta`` from a persisted balance snapshot and tx-id set.
+
+        Used when reloading from storage: pruned blocks no longer have raw
+        transaction data to replay, so the snapshot (not replay) is the only
+        way to restore state.
+        """
+        instance = cls()
+        instance.current_state = dict(state)
+        instance._applied_tx_ids = set(applied_tx_ids)
+        return instance

@@ -1,59 +1,138 @@
-"""Demo entry point wiring together block compression, state deltas,
-Merkle trees, pruning, and the mock ZK-SNARK interface."""
+"""Demo entry point: a hash-linked Block/Chain, SQLite persistence, pruning over
+the real chain, a Merkle inclusion proof, a Pedersen commitment + Schnorr
+zero-knowledge proof, and a structured metrics dump - one coherent system, not
+five disconnected utility demos.
+"""
 
 import logging
+import tempfile
+from pathlib import Path
 
-from blockchain_compression.compression import BlockCompressor, StateDelta
+from blockchain_compression.chain import Chain
 from blockchain_compression.merkle import MerkleTree
+from blockchain_compression.observability import get_metrics_registry
+from blockchain_compression.persistence import ChainStore
 from blockchain_compression.pruning import BlockchainPruner
-from blockchain_compression.zk_snark import ZKSnark
+from blockchain_compression.zk_proof import (
+    PedersenCommitment,
+    generate_proof,
+    hash_to_scalar,
+    verify_proof,
+)
 
 logger = logging.getLogger(__name__)
+
+_INITIAL_BATCHES = [
+    [{"tx_id": "tx-001", "account": "Alice", "amount": 100}],
+    [{"tx_id": "tx-002", "account": "Bob", "amount": 50}],
+    [
+        {"tx_id": "tx-003", "account": "Alice", "amount": -30},
+        {"tx_id": "tx-004", "account": "Bob", "amount": 20},
+        {"tx_id": "tx-005", "account": "Carol", "amount": 75},
+        {"tx_id": "tx-006", "account": "Alice", "amount": 10},
+    ],
+]
+
+
+def _sync_block(store: ChainStore, chain: Chain, block, transactions: list) -> None:
+    """Persist a block plus the state changes its transactions caused.
+
+    ``ChainStore.append_block`` is deliberately decoupled from ``Chain`` - it
+    has no way to derive these from a ``Chain.add_block()`` call on its own,
+    so the caller bridges the two explicitly, once, right here.
+    """
+    tx_ids = [tx["tx_id"] for tx in transactions]
+    accounts = {tx["account"] for tx in transactions}
+    updated_balances = {account: chain.state.get_current_state()[account] for account in accounts}
+    store.append_block(block, tx_ids, updated_balances)
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    metrics = get_metrics_registry()
 
     logger.info("=== Blockchain Data Compression and Management ===")
 
-    logger.info("\n--- Block Compression ---")
-    compressor = BlockCompressor()
-    block_data = b"Sample blockchain block data"
-    compressed_block = compressor.compress_block(block_data)
-    decompressed_block = compressor.decompress_block(compressed_block)
-    logger.info("Original block data: %s (%d bytes)", block_data, len(block_data))
-    logger.info("Compressed size: %d bytes", len(compressed_block))
-    logger.info("Decompressed block data: %s", decompressed_block)
+    logger.info("\n--- Assembling a hash-linked Chain ---")
+    chain = Chain(metrics=metrics)
+    for batch in _INITIAL_BATCHES:
+        chain.add_block(batch)
+    logger.info("Chain length (incl. genesis): %d", len(chain))
+    logger.info("Account state: %s", chain.state.get_current_state())
+    logger.info("validate_chain(): %s", chain.validate_chain())
 
-    logger.info("\n--- State Delta Storage ---")
-    state_delta = StateDelta()
-    transaction_1 = {"tx_id": "tx-001", "account": "Alice", "amount": 100}
-    transaction_2 = {"tx_id": "tx-002", "account": "Bob", "amount": 50}
-    state_delta.apply_transaction(transaction_1)
-    state_delta.apply_transaction(transaction_2)
-    state_delta.apply_transaction(transaction_1)  # replay is ignored (idempotent)
-    logger.info("Current state: %s", state_delta.get_current_state())
+    logger.info("\n--- Merkle Inclusion Proof (over a real block's transactions) ---")
+    proof_block = chain.get_block(3)  # the 4-transaction batch above
 
-    logger.info("\n--- Merkle Tree Verification ---")
-    transactions = ["tx1", "tx2", "tx3", "tx4"]
-    merkle_tree = MerkleTree(transactions)
-    root_hash = merkle_tree.get_root()
-    logger.info("Merkle Tree root hash: %s", root_hash)
-    proof = merkle_tree.get_proof(2)
-    logger.info("Inclusion proof for 'tx3': %s", proof)
-    logger.info("Proof verifies: %s", MerkleTree.verify_proof("tx3", proof, root_hash))
+    def _leaf(tx):
+        return f"{tx['tx_id']}:{tx['account']}:{tx['amount']}"
 
-    logger.info("\n--- Blockchain Pruning ---")
-    pruner = BlockchainPruner(max_blocks=2)
-    for number in (1, 2, 3):
-        pruner.add_block({"block_number": number, "data": f"Block {number} data"})
-    logger.info("Blocks after pruning: %s", pruner.get_blocks())
+    # Rebuilding a MerkleTree from the block's own transactions reproduces
+    # merkle_root only because Block.create used the same canonicalization -
+    # this is exactly what Block.verify_body() checks internally.
+    leaves = [_leaf(tx) for tx in proof_block.transactions]
+    tree = MerkleTree(leaves)
+    proof = tree.get_proof(0)
+    verified = MerkleTree.verify_proof(leaves[0], proof, tree.get_root())
+    logger.info("Proof for %s: %d step(s)", proof_block.transactions[0]["tx_id"], len(proof))
+    logger.info("Proof verifies against the tree's own root: %s", verified)
 
-    logger.info("\n--- ZK-SNARK Proof Generation and Verification (mock) ---")
-    zk = ZKSnark()
-    zk_proof = zk.generate_proof(transaction_1)
-    logger.info("Generated proof: %s", zk_proof)
-    logger.info("Proof verification result: %s", zk.verify_proof(zk_proof, transaction_1))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "chain.db"
+
+        logger.info("\n--- Persisting to SQLite (%s) ---", db_path)
+        with ChainStore(db_path) as store:
+            _sync_block(store, chain, chain.get_block(0), [])
+            for index, batch in enumerate(_INITIAL_BATCHES, start=1):
+                _sync_block(store, chain, chain.get_block(index), batch)
+
+            logger.info("\n--- Growing the chain and pruning under it ---")
+            pruner = BlockchainPruner(chain, max_full_blocks=2, metrics=metrics)
+            for i in range(4, 9):
+                # "tx-grow-*" - distinct from the "tx-00N" ids already used above,
+                # so this loop can't accidentally collide with them as replays.
+                batch = [{"tx_id": f"tx-grow-{i:03d}", "account": "Bob", "amount": 5}]
+                chain.add_block(batch)
+                _sync_block(store, chain, chain.get_block(i), batch)
+                for pruned_index in pruner.prune():
+                    store.mark_pruned(pruned_index)
+            logger.info("Chain length after growth: %d", len(chain))
+            logger.info("Blocks with a full body: %s", [b.index for b in chain if not b.is_pruned])
+            logger.info("validate_chain() after pruning: %s", chain.validate_chain())
+
+        logger.info("\n--- Reloading from disk ---")
+        with ChainStore(db_path) as store:
+            reloaded = store.load_chain()
+        logger.info("Reloaded chain length: %d", len(reloaded))
+        logger.info("Reloaded state: %s", reloaded.state.get_current_state())
+        logger.info(
+            "validate_chain() on the reloaded chain (pruned bodies and all): %s",
+            reloaded.validate_chain(),
+        )
+
+    logger.info("\n--- Pedersen Commitment + Schnorr Zero-Knowledge Proof ---")
+    secret_tx = _INITIAL_BATCHES[0][0]  # {"tx_id": "tx-001", "account": "Alice", "amount": 100}
+    message = hash_to_scalar(secret_tx)
+    pedersen = PedersenCommitment()
+    commitment, blinding = pedersen.commit(message)
+    zk_proof = generate_proof(
+        message=message, blinding=blinding, commitment=commitment, metrics=metrics
+    )
+    is_valid = verify_proof(zk_proof, commitment, metrics=metrics)
+    logger.info(
+        "Committed to a transaction without revealing it: C=%d...", commitment.value % 10**12
+    )
+    logger.info(
+        "verify_proof(proof, commitment) - no transaction data passed in at all: %s", is_valid
+    )
+    logger.info(
+        "(contrast with the old mock's verify_proof(proof, data), which needed the plaintext"
+        " to 'verify' - and so proved nothing was hidden)"
+    )
+
+    logger.info("\n--- Metrics ---")
+    logger.info("JSON:\n%s", metrics.to_json())
+    logger.info("Prometheus text exposition format:\n%s", metrics.to_prometheus_text())
 
 
 if __name__ == "__main__":

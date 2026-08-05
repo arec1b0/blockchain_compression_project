@@ -28,6 +28,8 @@ Homepage = "https://github.com/arec1b0/blockchain_compression_project"
 [project.scripts]
 blockchain-compress = "blockchain_compression.main:main"
 blockchain-compress-bench = "blockchain_compression.benchmarks.compression_benchmark:main"
+blockchain-compress-bench-merkle = "blockchain_compression.benchmarks.merkle_benchmark:main"
+blockchain-compress-bench-pruning = "blockchain_compression.benchmarks.pruning_benchmark:main"
 
 [dependency-groups]
 test = [

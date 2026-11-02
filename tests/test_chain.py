@@ -235,4 +235,7 @@ def test_chain_accepts_injected_state():
     state.apply_transaction(_tx("tx-0", "Alice", 500))
     chain = Chain(state=state)
 
-    assert chain.state.get_current_state() == {"Alice": 500}
+    chain.add_block([_tx("tx-1", "Alice", 100)])
+
+    assert chain.state is state
+    assert chain.state.get_current_state() == {"Alice": 600}

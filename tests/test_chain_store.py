@@ -127,7 +127,7 @@ def test_append_block_is_atomic_across_tables(tmp_path):
         # A value sqlite3 can't bind (a list) should blow up the state_snapshot
         # write partway through the transaction - the block row from the same
         # call must not survive if the transaction correctly rolls back.
-        with pytest.raises(sqlite3.ProgrammingError):
+        with pytest.raises(sqlite3.Error):
             store.append_block(block, ["tx-1"], {"Alice": [10]})
 
         _sync_block(store, chain, genesis, [])

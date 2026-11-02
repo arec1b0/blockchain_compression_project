@@ -8,6 +8,7 @@ corrupt the state.
 """
 
 import logging
+import math
 from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ class StateDelta:
         amount = transaction["amount"]
         if isinstance(amount, bool) or not isinstance(amount, (int, float)):
             raise ValueError("amount must be a number")
+        if isinstance(amount, float) and not math.isfinite(amount):
+            raise ValueError("amount must be finite")
 
     def apply_transaction(self, transaction: dict) -> dict:
         """Apply ``transaction`` to the state and return the resulting delta.

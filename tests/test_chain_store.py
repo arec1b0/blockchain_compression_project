@@ -192,9 +192,7 @@ def test_coordinated_prune_failure_leaves_chain_and_database_unchanged(tmp_path)
 
         assert all(not block.is_pruned for block in chain)
         assert chain.validate_chain()
-        rows = store._conn.execute(
-            "SELECT is_pruned FROM blocks ORDER BY idx"
-        ).fetchall()
+        rows = store._conn.execute("SELECT is_pruned FROM blocks ORDER BY idx").fetchall()
         assert [row["is_pruned"] for row in rows] == [0, 0, 0]
 
 

@@ -93,13 +93,9 @@ class ChainStore:
     def prune_chain(self, pruner: BlockchainPruner) -> list[int]:
         """Persist eligible pruning updates before pruning the corresponding blocks."""
         if not isinstance(pruner, BlockchainPruner):
-            raise TypeError(
-                f"pruner must be a BlockchainPruner, got {type(pruner).__name__}"
-            )
+            raise TypeError(f"pruner must be a BlockchainPruner, got {type(pruner).__name__}")
         cutoff = max(0, len(pruner.chain) - pruner.max_full_blocks)
-        candidates = [
-            block.index for block in pruner.chain.blocks[:cutoff] if not block.is_pruned
-        ]
+        candidates = [block.index for block in pruner.chain.blocks[:cutoff] if not block.is_pruned]
         if not candidates:
             return []
 

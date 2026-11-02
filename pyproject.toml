@@ -55,6 +55,18 @@ module-root = "src"
 testpaths = ["tests"]
 pythonpath = ["src"]
 
+[tool.coverage.run]
+source = ["blockchain_compression"]
+relative_files = true
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_empty = true
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

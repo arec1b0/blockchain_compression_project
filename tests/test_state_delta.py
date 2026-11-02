@@ -62,9 +62,7 @@ def test_from_snapshot_round_trip():
     original.apply_transaction(_tx("tx-1", "Alice", 100))
     original.apply_transaction(_tx("tx-2", "Bob", 50))
 
-    hydrated = StateDelta.from_snapshot(
-        original.get_current_state(), original.get_applied_tx_ids()
-    )
+    hydrated = StateDelta.from_snapshot(original.get_current_state(), original.get_applied_tx_ids())
 
     assert hydrated.get_current_state() == original.get_current_state()
     assert hydrated.get_applied_tx_ids() == original.get_applied_tx_ids()

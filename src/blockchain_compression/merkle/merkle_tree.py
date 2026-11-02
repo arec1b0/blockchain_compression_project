@@ -39,9 +39,7 @@ class MerkleTree:
     @staticmethod
     def hash_node(left: str, right: str) -> str:
         """Hash two child hex digests as an internal node (0x01-prefixed SHA-256)."""
-        return hashlib.sha256(
-            NODE_PREFIX + bytes.fromhex(left) + bytes.fromhex(right)
-        ).hexdigest()
+        return hashlib.sha256(NODE_PREFIX + bytes.fromhex(left) + bytes.fromhex(right)).hexdigest()
 
     @classmethod
     def _build_levels(cls, transactions: list) -> list:

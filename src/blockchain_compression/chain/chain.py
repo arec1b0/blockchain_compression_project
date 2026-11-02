@@ -35,35 +35,50 @@ class Chain:
         applied - a malformed transaction later in the batch can't leave
         state partially mutated with no corresponding block.
         """
+        block, staged_state = self._prepare_block(transactions)
+        self._commit_prepared_block(block, staged_state, transactions)
+        return block
+
+    def _prepare_block(self, transactions: list) -> tuple[Block, StateDelta]:
+        """Build a block and its resulting state without mutating this chain."""
         if not isinstance(transactions, list):
             raise TypeError(f"transactions must be a list, got {type(transactions).__name__}")
         for tx in transactions:
             StateDelta.validate_transaction(tx)
 
+        staged_state = StateDelta.from_snapshot(
+            self._state.get_current_state(), self._state.get_applied_tx_ids()
+        )
+        for tx in transactions:
+            staged_state.apply_transaction(tx)
+
         previous = self.blocks[-1]
-        new_block = Block.create(
+        block = Block.create(
             index=previous.index + 1,
             prev_hash=previous.hash,
             transactions=transactions,
         )
-        for tx in transactions:
-            self._state.apply_transaction(tx)
-        self.blocks.append(new_block)
+        return block, staged_state
 
+    def _commit_prepared_block(
+        self, block: Block, staged_state: StateDelta, transactions: list
+    ) -> None:
+        """Apply a prepared block and state; used by ChainStore after durable commit."""
+        self._state._replace_with(staged_state)
+        self.blocks.append(block)
         if self._metrics is not None:
             self._metrics.increment_counter(
                 "blocks_added_total", help_text="Total blocks appended to the chain"
             )
-            if new_block.compressed_body:
+            if block.compressed_body:
                 raw_size = len(canonical_json(transactions).encode("utf-8"))
-                ratio = raw_size / len(new_block.compressed_body)
+                ratio = raw_size / len(block.compressed_body)
                 self._metrics.set_gauge(
                     "compression_ratio",
                     ratio,
-                    labels={"block_index": str(new_block.index)},
+                    labels={"block_index": str(block.index)},
                     help_text="Raw / compressed body size for a block",
                 )
-        return new_block
 
     def validate_chain(self, check_bodies: bool = True) -> bool:
         """Walk the chain checking index continuity, ``prev_hash`` linkage,

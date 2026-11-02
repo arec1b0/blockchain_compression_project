@@ -8,6 +8,7 @@ corrupt the state.
 """
 
 import logging
+import math
 from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ class StateDelta:
         amount = transaction["amount"]
         if isinstance(amount, bool) or not isinstance(amount, (int, float)):
             raise ValueError("amount must be a number")
+        if isinstance(amount, float) and not math.isfinite(amount):
+            raise ValueError("amount must be finite")
 
     def apply_transaction(self, transaction: dict) -> dict:
         """Apply ``transaction`` to the state and return the resulting delta.
@@ -68,6 +71,13 @@ class StateDelta:
     def get_applied_tx_ids(self) -> frozenset:
         """Return the set of transaction IDs already applied (replay-protection state)."""
         return frozenset(self._applied_tx_ids)
+
+    def _replace_with(self, other: "StateDelta") -> None:
+        """Replace this state with a prepared state while preserving its identity."""
+        self.current_state.clear()
+        self.current_state.update(other.get_current_state())
+        self._applied_tx_ids.clear()
+        self._applied_tx_ids.update(other.get_applied_tx_ids())
 
     @classmethod
     def from_snapshot(cls, state: dict, applied_tx_ids: Iterable[str]) -> "StateDelta":

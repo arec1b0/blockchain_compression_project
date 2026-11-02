@@ -92,10 +92,8 @@ def main():
                 # "tx-grow-*" - distinct from the "tx-00N" ids already used above,
                 # so this loop can't accidentally collide with them as replays.
                 batch = [{"tx_id": f"tx-grow-{i:03d}", "account": "Bob", "amount": 5}]
-                chain.add_block(batch)
-                _sync_block(store, chain, chain.get_block(i), batch)
-                for pruned_index in pruner.prune():
-                    store.mark_pruned(pruned_index)
+                store.add_block(chain, batch)
+                store.prune_chain(pruner)
             logger.info("Chain length after growth: %d", len(chain))
             logger.info("Blocks with a full body: %s", [b.index for b in chain if not b.is_pruned])
             logger.info("validate_chain() after pruning: %s", chain.validate_chain())

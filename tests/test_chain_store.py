@@ -135,6 +135,69 @@ def test_append_block_is_atomic_across_tables(tmp_path):
         assert [row["idx"] for row in rows] == [0]  # only genesis, block 1 rolled back
 
 
+def test_coordinated_add_block_rolls_back_without_mutating_chain(tmp_path):
+    with ChainStore(tmp_path / "chain.db") as store:
+        chain = Chain()
+        store._conn.execute(
+            """
+            CREATE TRIGGER reject_state BEFORE INSERT ON state_snapshot
+            BEGIN SELECT RAISE(ABORT, 'injected state write failure'); END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.add_block(chain, [_tx("tx-1", "Alice", 10)])
+
+        assert len(chain) == 1
+        assert chain.state.get_current_state() == {}
+        assert chain.state.get_applied_tx_ids() == frozenset()
+        assert store._conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0] == 0
+        assert store._conn.execute("SELECT COUNT(*) FROM applied_tx_ids").fetchone()[0] == 0
+
+
+def test_coordinated_add_and_prune_round_trip(tmp_path):
+    db_path = tmp_path / "chain.db"
+    with ChainStore(db_path) as store:
+        chain = Chain()
+        for i in range(3):
+            store.add_block(chain, [_tx(f"tx-{i}", "Alice", 10)])
+
+        pruner = BlockchainPruner(chain, max_full_blocks=1)
+        pruned = store.prune_chain(pruner)
+
+        assert pruned == [0, 1, 2]
+        assert chain.validate_chain()
+
+    with ChainStore(db_path) as store:
+        reloaded = store.load_chain()
+    assert reloaded.validate_chain()
+    assert reloaded.state.get_current_state() == {"Alice": 30.0}
+    assert [block.is_pruned for block in reloaded] == [True, True, True, False]
+
+
+def test_coordinated_prune_failure_leaves_chain_and_database_unchanged(tmp_path):
+    with ChainStore(tmp_path / "chain.db") as store:
+        chain = _build_and_persist(store, num_blocks=2)
+        pruner = BlockchainPruner(chain, max_full_blocks=1)
+        store._conn.execute(
+            """
+            CREATE TRIGGER reject_prune BEFORE UPDATE OF body ON blocks
+            WHEN OLD.idx = 0
+            BEGIN SELECT RAISE(ABORT, 'injected prune failure'); END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.prune_chain(pruner)
+
+        assert all(not block.is_pruned for block in chain)
+        assert chain.validate_chain()
+        rows = store._conn.execute(
+            "SELECT is_pruned FROM blocks ORDER BY idx"
+        ).fetchall()
+        assert [row["is_pruned"] for row in rows] == [0, 0, 0]
+
+
 def test_context_manager_closes_connection(tmp_path):
     db_path = tmp_path / "chain.db"
     with ChainStore(db_path) as store:

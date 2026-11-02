@@ -72,6 +72,13 @@ class StateDelta:
         """Return the set of transaction IDs already applied (replay-protection state)."""
         return frozenset(self._applied_tx_ids)
 
+    def _replace_with(self, other: "StateDelta") -> None:
+        """Replace this state with a prepared state while preserving its identity."""
+        self.current_state.clear()
+        self.current_state.update(other.get_current_state())
+        self._applied_tx_ids.clear()
+        self._applied_tx_ids.update(other.get_applied_tx_ids())
+
     @classmethod
     def from_snapshot(cls, state: dict, applied_tx_ids: Iterable[str]) -> "StateDelta":
         """Rehydrate a ``StateDelta`` from a persisted balance snapshot and tx-id set.

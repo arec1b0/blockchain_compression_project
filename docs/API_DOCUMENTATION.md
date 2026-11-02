@@ -293,7 +293,7 @@ block is pruned, they're the *only* surviving record of what its transactions di
 - **Description**: Opens (creating if needed) a SQLite database at `path` and ensures the schema exists. Also usable as a context manager (`with ChainStore(path) as store:`).
 
 ##### `append_block(self, block: Block, applied_tx_ids: list, updated_accounts: dict) -> None`
-- **Description**: Persists `block` plus the state changes it caused, as one atomic transaction across all three tables - a crash mid-write can't leave a block recorded with no matching state update.
+- **Description**: Low-level API for persisting an already-created block and its state changes in one SQLite transaction. Prefer `add_block` when appending to a live chain so persistence and in-memory state remain coordinated.
 - **Example**:
   ```python
   from blockchain_compression.persistence import ChainStore
@@ -304,6 +304,17 @@ block is pruned, they're the *only* surviving record of what its transactions di
       updated = {tx["account"]: chain.state.get_current_state()[tx["account"]] for tx in transactions}
       store.append_block(block, tx_ids, updated)
   ```
+
+##### `add_block(self, chain: Chain, transactions: list) -> Block`
+- **Description**: Prepares a block and resulting state without mutating the chain, commits them to SQLite, then applies them to the in-memory chain. An empty store is initialized with the chain's genesis block; otherwise persisted headers must match the in-memory chain. A SQLite failure leaves both unchanged.
+- **Example**:
+  ```python
+  with ChainStore("chain.db") as store:
+      block = store.add_block(chain, transactions)
+  ```
+
+##### `prune_chain(self, pruner: BlockchainPruner) -> list[int]`
+- **Description**: Marks eligible block bodies pruned in SQLite in one transaction, then prunes the same blocks in memory. A SQLite failure leaves both the chain and persisted bodies unchanged.
 
 ##### `mark_pruned(self, index: int) -> None`
 - **Description**: Mirrors an in-memory `Block.prune()` in storage: drops the persisted body and sets `is_pruned`.

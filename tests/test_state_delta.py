@@ -94,5 +94,9 @@ def test_transaction_validation():
         state_delta.apply_transaction(_tx("tx-1", "Alice", "100"))
     with pytest.raises(ValueError):
         state_delta.apply_transaction(_tx("tx-1", "Alice", True))
+    with pytest.raises(ValueError):
+        state_delta.apply_transaction(_tx("tx-1", "Alice", float("nan")))
+    with pytest.raises(ValueError):
+        state_delta.apply_transaction(_tx("tx-1", "Alice", float("inf")))
     # Nothing was applied by the failed calls.
     assert state_delta.get_current_state() == {}

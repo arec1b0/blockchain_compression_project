@@ -12,6 +12,7 @@ from blockchain_compression.compression import BlockCompressor, StateDelta, extr
 from blockchain_compression.compression.state_delta import MAX_BALANCE, MIN_BALANCE
 from blockchain_compression.observability import MetricsRegistry
 from blockchain_compression.persistence import ChainStore
+from blockchain_compression.persistence.chain_store import _convert_legacy_balance
 from blockchain_compression.pruning import BlockchainPruner
 from blockchain_compression.zk_proof import (
     PedersenCommitment,
@@ -932,3 +933,234 @@ def test_bounded_applied_tx_ids_survive_pruning_compaction_and_reload(tmp_path):
     with ChainStore(db_path, max_cached_tx_ids=2) as store:
         detached = store.load_chain(max_cached_tx_ids=None)
     assert detached.state.get_applied_tx_ids() == frozenset(f"tx-{i}" for i in range(6))
+
+
+def test_convert_legacy_balance_edge_cases_and_precision_warning(caplog):
+    assert _convert_legacy_balance("Alice", 42) == 42
+
+    with pytest.raises(ValueError, match="non-string or empty account"):
+        _convert_legacy_balance("", 10)
+    with pytest.raises(ValueError, match="non-string or empty account"):
+        _convert_legacy_balance(123, 10)
+    with pytest.raises(ValueError, match="unsupported balance"):
+        _convert_legacy_balance("Alice", "bad")
+    with pytest.raises(ValueError, match="outside supported signed 64-bit"):
+        _convert_legacy_balance("Alice", MAX_BALANCE + 1)
+
+    with caplog.at_level("WARNING"):
+        large_val = _convert_legacy_balance("Alice", float(2**54))
+    assert large_val == 2**54
+    assert "exceeded 2**53" in caplog.text
+
+
+def test_chain_store_schema_healing_and_incompatible_column_checks(tmp_path):
+    # v2 DB with incompatible REAL state_snapshot.balance fails closed.
+    bad_v2 = tmp_path / "bad_v2.db"
+    with contextlib.closing(sqlite3.connect(str(bad_v2))) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE blocks (
+                idx INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, merkle_root TEXT,
+                hash TEXT NOT NULL UNIQUE, timestamp REAL NOT NULL, body BLOB,
+                is_pruned INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE state_snapshot (account TEXT PRIMARY KEY, balance REAL NOT NULL);
+            CREATE TABLE applied_tx_ids (
+                tx_id TEXT PRIMARY KEY,
+                block_idx INTEGER NOT NULL REFERENCES blocks(idx)
+            );
+            CREATE TABLE zk_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_idx INTEGER NOT NULL REFERENCES blocks(idx),
+                tx_id TEXT,
+                payload_json TEXT NOT NULL
+            );
+            PRAGMA user_version = 2;
+            """
+        )
+        conn.commit()
+    with pytest.raises(ValueError, match="incompatible state_snapshot.balance column type"):
+        ChainStore(bad_v2)
+
+    # Partial v1 DB missing applied_tx_ids heals missing v1 table and upgrades to v2.
+    partial_v1 = tmp_path / "partial_v1.db"
+    with contextlib.closing(sqlite3.connect(str(partial_v1))) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE blocks (
+                idx INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, merkle_root TEXT,
+                hash TEXT NOT NULL UNIQUE, timestamp REAL NOT NULL, body BLOB,
+                is_pruned INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE state_snapshot (
+                account TEXT PRIMARY KEY,
+                balance INTEGER NOT NULL CHECK (typeof(balance) = 'integer')
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+        conn.commit()
+    with ChainStore(partial_v1) as store:
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert store.applied_tx_count() == 0
+
+    # Partial v2 DB missing zk_attachments recreates it cleanly.
+    partial_v2 = tmp_path / "partial_v2.db"
+    with contextlib.closing(sqlite3.connect(str(partial_v2))) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE blocks (
+                idx INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, merkle_root TEXT,
+                hash TEXT NOT NULL UNIQUE, timestamp REAL NOT NULL, body BLOB,
+                is_pruned INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE state_snapshot (
+                account TEXT PRIMARY KEY,
+                balance INTEGER NOT NULL CHECK (typeof(balance) = 'integer')
+            );
+            CREATE TABLE applied_tx_ids (
+                tx_id TEXT PRIMARY KEY,
+                block_idx INTEGER NOT NULL REFERENCES blocks(idx)
+            );
+            PRAGMA user_version = 2;
+            """
+        )
+        conn.commit()
+    with ChainStore(partial_v2) as store:
+        tables = {
+            row[0]
+            for row in store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "zk_attachments" in tables
+
+    # Legacy v0 DB with blocks only (no state_snapshot) creates state_snapshot on migration.
+    partial_v0 = tmp_path / "partial_v0.db"
+    with contextlib.closing(sqlite3.connect(str(partial_v0))) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE blocks (
+                idx INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, merkle_root TEXT,
+                hash TEXT NOT NULL UNIQUE, timestamp REAL NOT NULL, body BLOB,
+                is_pruned INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.commit()
+    with ChainStore(partial_v0) as store:
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+def test_chain_store_error_paths_and_input_validation(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="max_cached_tx_ids"):
+        ChainStore(tmp_path / "bad_cache1.db", max_cached_tx_ids=-1)
+    with pytest.raises(ValueError, match="max_cached_tx_ids"):
+        ChainStore(tmp_path / "bad_cache2.db", max_cached_tx_ids=True)
+
+    db_path = tmp_path / "errors.db"
+    with ChainStore(db_path) as store:
+        with pytest.raises(TypeError, match="Chain"):
+            store.add_block("not-a-chain", [])
+        with pytest.raises(TypeError, match="BlockchainPruner"):
+            store.prune_chain("not-a-pruner")
+        with pytest.raises(ValueError, match="max_cached_tx_ids"):
+            store.load_chain(max_cached_tx_ids=-1)
+
+        # Reject seeding empty store from a multi-block chain or already-overflowed state.
+        unpersisted = Chain()
+        unpersisted.add_block([_tx("tx-u", "Alice", 1)])
+        with pytest.raises(ValueError, match="unpersisted chain"):
+            store.add_block(unpersisted, [_tx("tx-u2", "Alice", 1)])
+
+        overflow_state = StateDelta(max_applied_tx_ids=1, tx_lookup=lambda _tx_id: False)
+        overflow_state.apply_transaction(_tx("tx-o1", "Alice", 1))
+        overflow_state.apply_transaction(_tx("tx-o2", "Alice", 1))
+        with pytest.raises(ValueError, match="already overflowed"):
+            store.add_block(Chain(state=overflow_state), [_tx("tx-o3", "Alice", 1)])
+
+        # Persist real blocks cleanly, then exercise append/prune/compact error paths.
+        chain = Chain()
+        store.add_block(chain, [_tx("tx-1", "Alice", 10)])
+        store.add_block(chain, [_tx("tx-2", "Alice", 10)])
+
+        with pytest.raises(TypeError, match="updated_accounts"):
+            store.append_block(chain.get_block(0), [], "not-a-dict")
+        with pytest.raises(ValueError, match="non-empty strings"):
+            store.append_block(chain.get_block(0), [], {"": 10})
+
+        pruner = BlockchainPruner(chain, max_full_blocks=2)
+        with pytest.raises(TypeError, match="compact"):
+            store.prune_chain(pruner, compact="yes")
+        # Retention window covers all 3 blocks (0, 1, 2); wait max_full_blocks=3 keeps all.
+        pruner_noop = BlockchainPruner(chain, max_full_blocks=3)
+        assert store.prune_chain(pruner_noop) == []
+
+        # compact() inside an open transaction raises RuntimeError cleanly.
+        store._conn.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(RuntimeError, match="transaction is active"):
+                store.compact()
+        finally:
+            store._conn.execute("ROLLBACK")
+
+        # Mid-prune chain mutation before or inside pruner.prune() rolls back safely.
+        pruner_mut = BlockchainPruner(chain, max_full_blocks=2)
+        orig_eligible = pruner_mut.eligible_block_indices
+
+        def _mutating_eligible():
+            res = orig_eligible()
+            chain.add_block([_tx("tx-race", "Bob", 5)])
+            return res
+
+        monkeypatch.setattr(pruner_mut, "eligible_block_indices", _mutating_eligible)
+        with pytest.raises(RuntimeError, match="chain changed while pruning"):
+            store.prune_chain(pruner_mut)
+        assert all(not b.is_pruned for b in chain)
+
+        chain_small = Chain()
+        db_mismatch = tmp_path / "prune_mismatch.db"
+        with ChainStore(db_mismatch) as store2:
+            store2.add_block(chain_small, [_tx("tx-a", "Alice", 5)])
+            p_mismatch = BlockchainPruner(chain_small, max_full_blocks=1)
+            monkeypatch.setattr(p_mismatch, "prune", lambda: [999])
+            with pytest.raises(RuntimeError, match="chain changed while pruning"):
+                store2.prune_chain(p_mismatch)
+            assert not chain_small.get_block(0).is_pruned
+
+            # Missing persisted block row raises KeyError and rolls back cleanly.
+            monkeypatch.undo()
+            store2._conn.execute("DELETE FROM blocks WHERE idx = 0")
+            with pytest.raises(KeyError, match="no persisted block with index 0"):
+                store2.prune_chain(p_mismatch)
+            assert not chain_small.get_block(0).is_pruned
+
+
+def test_load_chain_zero_cache_zk_mismatch_and_int64_boundaries(tmp_path):
+    db_path = tmp_path / "zero_cache_and_bounds.db"
+    tx_max = _tx("tx-max", "MaxAcct", MAX_BALANCE)
+    tx_min = _tx("tx-min", "MinAcct", MIN_BALANCE)
+    commitment, blinding = PedersenCommitment().commit(42)
+    proof = generate_proof(message=42, blinding=blinding, commitment=commitment)
+    att = ZKAttachment(commitment=commitment, proof=proof, tx_id="tx-max")
+
+    with ChainStore(db_path) as store:
+        chain = Chain()
+        store.add_block(chain, [tx_max], zk_attachments=[att])
+        store.add_block(chain, [tx_min])
+
+        # max_cached_tx_ids=0 keeps zero tx IDs in RAM and checks SQLite directly.
+        zero_cached = store.load_chain(max_cached_tx_ids=0)
+        assert zero_cached.state.cached_applied_tx_count == 0
+        assert zero_cached.state.is_applied("tx-max") is True
+        assert zero_cached.state.is_applied("tx-unseen") is False
+        assert zero_cached.state.get_current_state() == {
+            "MaxAcct": MAX_BALANCE,
+            "MinAcct": MIN_BALANCE,
+        }
+
+    # Corrupted zk_attachments.tx_id mismatch vs payload_json fails closed.
+    _exec_db(db_path, "UPDATE zk_attachments SET tx_id = 'mismatched-id'")
+    with ChainStore(db_path) as store:
+        with pytest.raises(ValueError, match="does not match payload_json"):
+            store.load_chain()

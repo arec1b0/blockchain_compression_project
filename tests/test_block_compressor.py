@@ -105,7 +105,7 @@ def test_large_compressible_payload_uses_lzma_framing_and_shrinks():
 
 
 def test_incompressible_payload_falls_back_to_raw_unless_threshold_is_zero():
-    incompressible = random.Random(42).randbytes(512)
+    incompressible = random.Random(42).randbytes(512)  # noqa: S311  # deterministic test bytes
     smart = BlockCompressor(preset=1, min_compress_bytes=256)
     encoded_smart = smart.compress_block(incompressible)
     assert encoded_smart[0] == FRAME_RAW

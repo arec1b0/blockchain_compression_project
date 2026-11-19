@@ -64,11 +64,12 @@ There is no `requirements.txt` and no `pip install` step — everything goes thr
 Development tooling is split into [PEP 735](https://peps.python.org/pep-0735/) `dependency-groups`
 in `pyproject.toml`, not into extras:
 
-| Group  | Contents               | Install with                |
-| ------ | ---------------------- | --------------------------- |
-| `test` | `pytest`, `pytest-cov` | `uv sync --only-group test` |
-| `lint` | `ruff`                 | `uv sync --only-group lint` |
-| `dev`  | `test` + `lint`        | `uv sync` (default)         |
+| Group       | Contents                       | Install with                     |
+| ----------- | ------------------------------ | -------------------------------- |
+| `test`      | `pytest`, `pytest-cov`         | `uv sync --only-group test`      |
+| `lint`      | `ruff`                         | `uv sync --only-group lint`      |
+| `typecheck` | `mypy`                         | `uv sync --only-group typecheck` |
+| `dev`       | `test` + `lint` + `typecheck`  | `uv sync` (default)              |
 
 Useful commands:
 
@@ -101,7 +102,7 @@ uv build                      # build sdist + wheel into dist/
   - **Dependency Inversion**: Depend on abstractions, not concrete implementations.
   
 ### Cryptographic Integrity:
-- If you work on cryptographic components (e.g., Merkle Trees, ZK-SNARKs), ensure that any changes or additions maintain the cryptographic security of the system.
+- If you work on cryptographic components (e.g., Merkle Trees, Pedersen commitments, and Schnorr zero-knowledge proofs), ensure that any changes or additions maintain the cryptographic security of the system.
 - Avoid using custom cryptographic algorithms unless necessary. Always prefer well-tested, standard algorithms.
   
 ### Documentation:
@@ -125,11 +126,14 @@ Before submitting changes, make sure that all tests pass successfully. We use **
    - Name your test functions with the `test_` prefix.
    - Ensure that all critical components (e.g., compression, cryptographic verification, state management) are thoroughly tested.
 
-3. Code coverage:
-   - Ensure the code you contribute is well-tested to maintain or improve the current level of test coverage.
-   - You can check code coverage by running:
+3. Code coverage and static checks:
+   - Ensure the code you contribute meets the 90% coverage gate, lints cleanly, passes `mypy`, and keeps `uv.lock` synchronized:
      ```bash
-     uv run pytest --cov=src
+     uv run pytest --cov
+     uv run ruff check .
+     uv run ruff format --check src tests
+     uv run mypy src
+     uv lock --check
      ```
 
 ---

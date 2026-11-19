@@ -1,5 +1,6 @@
 # test_merkle_benchmark.py
 
+from blockchain_compression.benchmarks import merkle_benchmark as merkle_bench
 from blockchain_compression.benchmarks.merkle_benchmark import benchmark_size
 
 
@@ -22,3 +23,16 @@ def test_single_transaction_has_empty_proof():
     result = benchmark_size(1, repeats=1)
     assert result.proof_length == 0
     assert result.log2_bound == 0
+
+
+def test_merkle_benchmark_run_and_main_fast(monkeypatch, caplog):
+    monkeypatch.setattr(
+        merkle_bench,
+        "run_benchmarks",
+        lambda sizes=(4, 8), repeats=1: [benchmark_size(s, repeats) for s in sizes],
+    )
+    with caplog.at_level("INFO"):
+        merkle_bench.main()
+
+    assert "transactions" in caplog.text
+    assert "get_proof ms" in caplog.text

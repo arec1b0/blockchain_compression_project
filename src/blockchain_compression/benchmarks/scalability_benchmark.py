@@ -192,7 +192,8 @@ def benchmark_block_compression(
             comp = BlockCompressor(preset=preset, min_compress_bytes=threshold)
             # 1 warm-up before timed repetitions.
             warm = Block.create(index=1, prev_hash="0" * 64, transactions=batch, compressor=comp)
-            assert warm.compressed_body is not None
+            if warm.compressed_body is None:
+                raise RuntimeError("expected compressed_body on newly created block")
 
             t0 = time.perf_counter()
             blk = warm
@@ -201,7 +202,8 @@ def benchmark_block_compression(
             create_ms = (time.perf_counter() - t0) / reps * 1000.0
 
             stored = blk.compressed_body
-            assert stored is not None
+            if stored is None:
+                raise RuntimeError("expected compressed_body on newly created block")
             t0 = time.perf_counter()
             for _ in range(reps):
                 decoded = comp.decompress_block(stored)
@@ -457,40 +459,40 @@ def main() -> None:
     )
 
     logger.info("\n=== 1. JSON Serialization (Double vs Single-Pass) ===")
-    for r in benchmark_serialization():
+    for ser in benchmark_serialization():
         logger.info(
             "%-14s raw=%6dB | old=%.4fms new=%.4fms (speedup=%.2fx)",
-            r.label,
-            r.raw_bytes,
-            r.old_ms,
-            r.new_ms,
-            r.old_ms / max(r.new_ms, 1e-9),
+            ser.label,
+            ser.raw_bytes,
+            ser.old_ms,
+            ser.new_ms,
+            ser.old_ms / max(ser.new_ms, 1e-9),
         )
 
     logger.info("\n=== 2. Block Compression & Framing ===")
-    for r in benchmark_block_compression():
+    for comp in benchmark_block_compression():
         logger.info(
             "%-13s preset=%d thresh=%3d frame=%-10s raw=%6dB stored=%6dB "
             "ratio=%5.2fx create=%7.3fms decomp=%6.3fms cap_ok=%s",
-            r.label,
-            r.preset,
-            r.min_compress_bytes,
-            r.frame,
-            r.raw_bytes,
-            r.stored_bytes,
-            r.ratio,
-            r.create_ms,
-            r.decompress_ms,
-            r.bomb_cap_rejected,
+            comp.label,
+            comp.preset,
+            comp.min_compress_bytes,
+            comp.frame,
+            comp.raw_bytes,
+            comp.stored_bytes,
+            comp.ratio,
+            comp.create_ms,
+            comp.decompress_ms,
+            comp.bomb_cap_rejected,
         )
 
     logger.info("\n=== 3. In-Memory Chain.add_block Scaling ===")
-    for r in benchmark_chain_append():
+    for app in benchmark_chain_append():
         logger.info(
             "height=%4d: %.3f ms/block | traced_mem=%.1f KiB",
-            r.height,
-            r.avg_ms_per_block,
-            r.traced_mem_kib,
+            app.height,
+            app.avg_ms_per_block,
+            app.traced_mem_kib,
         )
 
     logger.info("\n=== 4. Incremental Pruning ===")

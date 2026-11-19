@@ -47,11 +47,12 @@ verifiability back to genesis.
   (`lzma`, `sqlite3`, `hashlib`, `secrets`, ...) - no runtime dependencies. Development
   tools are declared in [PEP 735](https://peps.python.org/pep-0735/) `dependency-groups`:
 
-  | Group  | Contents                | Purpose                    |
-  | ------ | ----------------------- | --------------------------- |
-  | `test` | `pytest`, `pytest-cov`  | Test suite and coverage    |
-  | `lint` | `ruff`                  | Linting and import sorting |
-  | `dev`  | `test` + `lint`         | Default local environment  |
+  | Group       | Contents                      | Purpose                                 |
+  | ----------- | ----------------------------- | --------------------------------------- |
+  | `test`      | `pytest`, `pytest-cov`        | Test suite and coverage                 |
+  | `lint`      | `ruff`                        | Linting, security rules, and formatting |
+  | `typecheck` | `mypy`                        | Static type checking                    |
+  | `dev`       | `test` + `lint` + `typecheck` | Default local environment               |
 
 ---
 
@@ -240,22 +241,14 @@ If you want to contribute to the project or run tests, follow the steps below.
 
 #### Running Unit Tests
 
-We use **pytest** for testing. To run all tests, use the following command:
+We use **pytest** for testing (minimum enforced coverage: `fail_under = 90` in `pyproject.toml`), **ruff** (`E`, `F`, `W`, `I`, `B`, `UP`, `S`) for linting/security checks, and **mypy** (with PEP 561 `py.typed` packaged for downstream typed consumers). CI runs across both `ubuntu-latest` and `windows-latest` on Python 3.10–3.13, plus `uv lock --check` and `pip-audit`. To run checks locally:
 
 ```bash
-uv run pytest
-```
-
-With coverage:
-
-```bash
-uv run pytest --cov=src
-```
-
-Linting is handled by **ruff** (`lint` group):
-
-```bash
+uv run pytest --cov
 uv run ruff check .
+uv run ruff format --check src tests
+uv run mypy src
+uv lock --check
 ```
 
 The tests cover every module: block/chain hash-linkage and pruning, SQLite persistence

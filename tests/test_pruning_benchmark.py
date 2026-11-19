@@ -1,5 +1,6 @@
 # test_pruning_benchmark.py
 
+from blockchain_compression.benchmarks import pruning_benchmark as prune_bench
 from blockchain_compression.benchmarks.pruning_benchmark import _build_chain, benchmark_pruning
 from blockchain_compression.pruning import BlockchainPruner
 
@@ -25,3 +26,18 @@ def test_benchmark_pruning_smoke():
     assert result.prune_seconds > 0
     assert result.memory_before_bytes > 0
     assert result.memory_freed_bytes > 0  # pruning must actually free traced memory
+
+
+def test_pruning_benchmark_run_and_main_fast(monkeypatch, caplog):
+    monkeypatch.setattr(
+        prune_bench,
+        "run_benchmarks",
+        lambda chain_lengths=(15, 25), max_full_blocks=5: [
+            benchmark_pruning(length, max_full_blocks) for length in chain_lengths
+        ],
+    )
+    with caplog.at_level("INFO"):
+        prune_bench.main()
+
+    assert "chain length" in caplog.text
+    assert "freed KB" in caplog.text

@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
@@ -28,8 +29,11 @@ jobs:
           enable-cache: true
           python-version: "3.12"
 
-      - name: Install lint tools
-        run: uv sync --locked --no-default-groups --group lint
+      - name: Verify lockfile is up to date
+        run: uv lock --check
+
+      - name: Install lint and typecheck tools
+        run: uv sync --locked --no-default-groups --group lint --group typecheck
 
       - name: Ruff
         run: uv run --no-sync ruff check .
@@ -37,14 +41,23 @@ jobs:
       - name: Ruff format
         run: uv run --no-sync ruff format --check src tests
 
+      - name: Type check (mypy)
+        run: uv run --no-sync mypy src
+
+      - name: Audit locked dependencies
+        run: |
+          uv export --quiet --locked --no-emit-project --all-groups --format requirements-txt -o /tmp/requirements-audit.txt
+          uvx pip-audit -r /tmp/requirements-audit.txt --no-deps --disable-pip
+
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
 
@@ -61,11 +74,11 @@ jobs:
         run: uv run --no-sync pytest --cov --cov-report=term-missing --cov-report=xml
 
       - name: Coverage summary
-        if: matrix.python-version == '3.12'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         run: uv run --no-sync coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage report
-        if: matrix.python-version == '3.12'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         uses: actions/upload-artifact@v7
         with:
           name: coverage-xml
@@ -96,7 +109,7 @@ jobs:
           uv venv --python 3.12 /tmp/wheeltest
           uv pip install --python /tmp/wheeltest/bin/python dist/*.whl
           /tmp/wheeltest/bin/blockchain-compress
-          /tmp/wheeltest/bin/python -c "import blockchain_compression; from blockchain_compression.chain import Chain"
+          /tmp/wheeltest/bin/python -c "import importlib.resources as r, blockchain_compression; from blockchain_compression.chain import Chain; assert (r.files('blockchain_compression') / 'py.typed').is_file()"
 
       - name: Upload distributions
         uses: actions/upload-artifact@v7

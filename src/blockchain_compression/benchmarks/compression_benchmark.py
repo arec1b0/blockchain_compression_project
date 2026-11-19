@@ -10,6 +10,7 @@ Run with ``blockchain-compress-bench`` or
 import json
 import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from blockchain_compression.benchmarks.timing import best_time
@@ -45,7 +46,7 @@ class BenchmarkResult:
 
 def synthetic_block_data(num_blocks: int = 200, txs_per_block: int = 50) -> bytes:
     """JSON-serialized blocks with pseudo-random transactions (deterministic seed)."""
-    rng = random.Random(_SEED)
+    rng = random.Random(_SEED)  # noqa: S311  # non-cryptographic synthetic benchmark data
     blocks = []
     for number in range(num_blocks):
         transactions = [
@@ -69,10 +70,10 @@ def repetitive_data(size: int = 1_000_000) -> bytes:
 
 def random_data(size: int = 1_000_000) -> bytes:
     """Incompressible high-entropy data: worst case for compression."""
-    return random.Random(_SEED).randbytes(size)
+    return random.Random(_SEED).randbytes(size)  # noqa: S311  # non-cryptographic benchmark data
 
 
-DATASETS = {
+DATASETS: dict[str, Callable[[], bytes]] = {
     "synthetic-blocks": synthetic_block_data,
     "repetitive": repetitive_data,
     "random": random_data,
@@ -95,7 +96,7 @@ def benchmark_dataset(name: str, data: bytes, preset: int, repeats: int = 3) -> 
     )
 
 
-def run_benchmarks(presets=(1, 6, 9), repeats: int = 3) -> list:
+def run_benchmarks(presets: tuple[int, ...] = (1, 6, 9), repeats: int = 3) -> list[BenchmarkResult]:
     results = []
     for name, make_data in DATASETS.items():
         data = make_data()
@@ -104,7 +105,7 @@ def run_benchmarks(presets=(1, 6, 9), repeats: int = 3) -> list:
     return results
 
 
-def main():
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     header = (
         f"{'dataset':<18} {'preset':>6} {'orig KB':>9} {'comp KB':>9} "

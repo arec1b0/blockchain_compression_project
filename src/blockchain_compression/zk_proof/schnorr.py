@@ -47,19 +47,18 @@ _PROOF_DICT_KEYS = frozenset({"version", "group", "t", "s1", "s2"})
 
 
 def _validate_proof_components(t: object, s1: object, s2: object) -> tuple[int, int, int]:
-    _require_strict_int(t, "proof.t")
-    _require_strict_int(s1, "proof.s1")
-    _require_strict_int(s2, "proof.s2")
-    assert isinstance(t, int) and isinstance(s1, int) and isinstance(s2, int)
-    if not 1 <= t < P:
+    t_int = _require_strict_int(t, "proof.t")
+    s1_int = _require_strict_int(s1, "proof.s1")
+    s2_int = _require_strict_int(s2, "proof.s2")
+    if not 1 <= t_int < P:
         raise ValueError("proof.t must be in [1, P)")
-    if not 0 <= s1 < Q:
+    if not 0 <= s1_int < Q:
         raise ValueError("proof.s1 must be in [0, Q)")
-    if not 0 <= s2 < Q:
+    if not 0 <= s2_int < Q:
         raise ValueError("proof.s2 must be in [0, Q)")
-    if powmod(t, Q, P) != 1:
+    if powmod(t_int, Q, P) != 1:
         raise ValueError("proof.t must belong to the order-Q subgroup")
-    return t, s1, s2
+    return t_int, s1_int, s2_int
 
 
 @dataclass(frozen=True)
@@ -133,9 +132,10 @@ class SchnorrProof:
         return cls(t=t, s1=s1, s2=s2)
 
 
-def _require_strict_int(value: object, name: str) -> None:
+def _require_strict_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
+    return value
 
 
 def _challenge(commitment_value: int, t: int) -> int:

@@ -8,8 +8,33 @@ permissions:
   contents: read
 
 jobs:
+  check-tag:
+    name: verify release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check tag matches pyproject.toml version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 -c '
+          import os, tomllib
+          tag = os.environ["RELEASE_TAG"]
+          with open("pyproject.toml", "rb") as f:
+              version = tomllib.load(f)["project"]["version"]
+          if tag not in (version, f"v{version}"):
+              raise SystemExit(f"Release tag {tag!r} does not match pyproject.toml version {version!r}")
+          print(f"Verified tag {tag!r} matches package version {version!r}")
+          '
+
+  ci:
+    uses: ./.github/workflows/python-app.yml
+
   pypi:
     name: publish
+    needs: [check-tag, ci]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: pypi

@@ -148,7 +148,8 @@ class StateDelta:
             return True
         if not self._has_overflow:
             return False
-        assert self._tx_lookup is not None
+        if self._tx_lookup is None:
+            raise RuntimeError("tx_lookup is required when applied_tx_ids cache overflows")
         found = bool(self._tx_lookup(tx_id))
         if found and self._max_applied_tx_ids > 0:
             self._record_applied_tx(tx_id)

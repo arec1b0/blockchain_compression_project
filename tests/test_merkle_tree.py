@@ -137,3 +137,18 @@ def test_hash_node_validates_digests():
         MerkleTree.hash_node(123, valid)
     with pytest.raises(ValueError):
         MerkleTree.hash_node("bad", valid)
+
+
+def test_verify_proof_rejects_invalid_types_and_bad_hex_deterministically():
+    tree = MerkleTree(["tx1", "tx2"])
+    root = tree.get_root()
+    proof = tree.get_proof(0)
+
+    with pytest.raises(TypeError, match="transaction must be a string"):
+        MerkleTree.verify_proof(123, proof, root)
+    with pytest.raises(TypeError, match="proof must be a list"):
+        MerkleTree.verify_proof("tx1", "not-a-list", root)
+    with pytest.raises(ValueError, match="64-character hexadecimal"):
+        MerkleTree.verify_proof("tx1", proof, "z" * 64)
+    with pytest.raises(ValueError, match="64-character hexadecimal"):
+        MerkleTree.verify_proof("tx1", [{"hash": "z" * 64, "position": "right"}], root)

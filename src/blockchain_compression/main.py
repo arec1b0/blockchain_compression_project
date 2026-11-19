@@ -4,11 +4,13 @@ zero-knowledge proof, and a structured metrics dump - one coherent system, not
 five disconnected utility demos.
 """
 
+import argparse
 import logging
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 
-from blockchain_compression.chain import Chain
+from blockchain_compression.chain import Block, Chain
 from blockchain_compression.compression import extract_block_delta
 from blockchain_compression.merkle import MerkleTree
 from blockchain_compression.observability import get_metrics_registry
@@ -37,7 +39,7 @@ _INITIAL_BATCHES = [
 ]
 
 
-def _sync_block(store: ChainStore, chain: Chain, block, transactions: list) -> None:
+def _sync_block(store: ChainStore, chain: Chain, block: Block, transactions: list) -> None:
     """Persist a block plus the state changes its transactions caused.
 
     ``ChainStore.append_block`` is deliberately decoupled from ``Chain`` - it
@@ -48,7 +50,35 @@ def _sync_block(store: ChainStore, chain: Chain, block, transactions: list) -> N
     store.append_block(block, delta.tx_ids, delta.updated_accounts)
 
 
-def main():
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="blockchain-compress",
+        description=(
+            "Demonstrate compressed hash-linked chain persistence, pruning, ZK proofs, and metrics."
+        ),
+    )
+    parser.add_argument(
+        "--max-full-blocks",
+        type=int,
+        default=2,
+        help="Number of recent full block bodies to keep when pruning (minimum 1).",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=None,
+        help="Optional SQLite database file path (uses a temporary directory by default).",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the end-to-end CLI walkthrough with optional retention/storage flags."""
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.max_full_blocks < 1:
+        parser.error("--max-full-blocks must be at least 1")
+
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     metrics = get_metrics_registry()
 
@@ -64,6 +94,8 @@ def main():
 
     logger.info("\n--- Merkle Inclusion Proof (over a real block's transactions) ---")
     proof_block = chain.get_block(3)  # the 4-transaction batch above
+    if proof_block.transactions is None:
+        raise RuntimeError("expected transactions to be present on unpruned proof block")
 
     def _leaf(tx):
         return f"{tx['tx_id']}:{tx['account']}:{tx['amount']}"
@@ -78,8 +110,15 @@ def main():
     logger.info("Proof for %s: %d step(s)", proof_block.transactions[0]["tx_id"], len(proof))
     logger.info("Proof verifies against the tree's own root: %s", verified)
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        db_path = Path(tmp_dir) / "chain.db"
+    db_ctx = (
+        tempfile.TemporaryDirectory()
+        if args.db_path is None
+        else nullcontext(str(args.db_path.parent))
+    )
+    with db_ctx as tmp_dir:
+        db_path = Path(tmp_dir) / "chain.db" if args.db_path is None else args.db_path
+        if args.db_path is not None:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
 
         logger.info("\n--- Persisting to SQLite (%s) ---", db_path)
         with ChainStore(db_path) as store:
@@ -88,7 +127,7 @@ def main():
                 _sync_block(store, chain, chain.get_block(index), batch)
 
             logger.info("\n--- Growing the chain and pruning under it ---")
-            pruner = BlockchainPruner(chain, max_full_blocks=2, metrics=metrics)
+            pruner = BlockchainPruner(chain, max_full_blocks=args.max_full_blocks, metrics=metrics)
             for i in range(4, 9):
                 # "tx-grow-*" - distinct from the "tx-00N" ids already used above,
                 # so this loop can't accidentally collide with them as replays.

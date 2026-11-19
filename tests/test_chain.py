@@ -330,19 +330,39 @@ def test_add_block_rejects_duplicate_tx_id_in_same_batch():
 
 @pytest.mark.parametrize("payload", [b"123", b'{"a": 1}', b"null", b'"hello"'])
 def test_verify_body_handles_non_list_json_without_raising(payload):
-    compressed = BlockCompressor().compress_block(payload)
-    reloaded = Block.from_persisted(
-        index=0,
-        prev_hash=Chain.GENESIS_PREV_HASH,
-        merkle_root=None,
-        hash="c" * 64,
-        timestamp=0.0,
-        compressed_body=compressed,
-        is_pruned=False,
-    )
+    for min_compress in (0, 256):
+        compressed = BlockCompressor(min_compress_bytes=min_compress).compress_block(payload)
+        reloaded = Block.from_persisted(
+            index=0,
+            prev_hash=Chain.GENESIS_PREV_HASH,
+            merkle_root=None,
+            hash="c" * 64,
+            timestamp=0.0,
+            compressed_body=compressed,
+            is_pruned=False,
+        )
 
+        assert reloaded.transactions is None
+        assert reloaded.verify_body() is False
+
+
+def test_raw_framed_body_enforces_decompression_cap():
+    raw_large = BlockCompressor(min_compress_bytes=10_000).compress_block(
+        b'[{"tx_id":"tx-1","account":"Alice","amount":1}]'
+    )
+    assert raw_large[0] == FRAME_RAW
+    reloaded = Block.from_persisted(
+        index=1,
+        prev_hash=Chain.GENESIS_PREV_HASH,
+        merkle_root="a" * 64,
+        hash="b" * 64,
+        timestamp=0.0,
+        compressed_body=raw_large,
+        is_pruned=False,
+        max_decompressed_bytes=16,
+    )
     assert reloaded.transactions is None
-    assert reloaded.verify_body() is False
+    assert reloaded.verify_body(max_decompressed_bytes=16) is False
 
 
 def test_verify_body_false_for_pruned_block_with_populated_body_or_transactions():

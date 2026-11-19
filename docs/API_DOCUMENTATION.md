@@ -6,24 +6,44 @@ This document provides detailed information on the various modules, classes, and
 
 ## **Table of Contents**
 
-1. [Chain Module](#chain-module)
+1. [Canonical JSON Module](#canonical-json-module)
+    - [canonical_json](#canonical_jsonobj---str)
+2. [Chain Module](#chain-module)
     - [Block](#block)
     - [Chain](#chain)
-2. [Compression Module](#compression-module)
+3. [Compression Module](#compression-module)
     - [BlockCompressor](#blockcompressor)
-3. [State Delta Module](#state-delta-module)
+4. [State Delta Module](#state-delta-module)
     - [StateDelta](#statedelta)
-4. [Merkle Tree Module](#merkle-tree-module)
+5. [Merkle Tree Module](#merkle-tree-module)
     - [MerkleTree](#merkletree)
-5. [Blockchain Pruner Module](#blockchain-pruner-module)
+6. [Blockchain Pruner Module](#blockchain-pruner-module)
     - [BlockchainPruner](#blockchainpruner)
-6. [Persistence Module](#persistence-module)
+7. [Persistence Module](#persistence-module)
     - [ChainStore](#chainstore)
-7. [ZK Proof Module](#zk-proof-module)
+8. [ZK Proof Module](#zk-proof-module)
+    - [Commitment](#commitment)
     - [PedersenCommitment](#pedersencommitment)
+    - [SchnorrProof](#schnorrproof)
     - [Schnorr proof functions](#schnorr-proof-functions)
-8. [Observability Module](#observability-module)
+9. [Observability Module](#observability-module)
     - [MetricsRegistry](#metricsregistry)
+10. [CLI Entry Point](#cli-entry-point)
+    - [main](#mainargv-liststr--none---none)
+
+---
+
+## Canonical JSON Module
+
+### **`canonical_json(obj) -> str`**
+- **Description**: Deterministic RFC 8259 JSON encoder (`sort_keys=True`, compact `(",", ":")` separators, `allow_nan=False`) shared across block hashing, compression serialization, ZK attachment storage, and scalar hashing so digests and payloads never drift across call sites.
+- **Raises**: `TypeError` for non-JSON-native objects (such as raw `bytes` or `set`, without `str()` coercion); `ValueError` for non-finite floats (`NaN`, `Infinity`, `-Infinity`).
+- **Example**:
+  ```python
+  from blockchain_compression.canonical import canonical_json
+
+  encoded = canonical_json({"tx_id": "tx-1", "account": "Alice", "amount": 100})
+  ```
 
 ---
 
@@ -159,10 +179,17 @@ The `BlockCompressor` class encodes and decodes block bodies using size-aware fr
 
 ##### `__init__(self, preset: int = 1, max_decompressed_bytes: int = 16 * 1024 * 1024, min_compress_bytes: int = 256)`
 - **Description**: Initializes the block compressor with LZMA `preset` (`0`–`9`, default `DEFAULT_PRESET = 1`), output cap `max_decompressed_bytes` (default `16 MiB`), and size threshold `min_compress_bytes` (default `DEFAULT_COMPRESSION_THRESHOLD = 256` bytes; pass `0` to force `FRAME_LZMA` for all inputs).
-- **Raises**: `ValueError` if `preset` is outside `0..9`, `max_decompressed_bytes < 1`, or `min_compress_bytes < 0`.
+- **Raises**: `ValueError` if `preset` is not a strict `int` in `0..9`, `max_decompressed_bytes < 1`, or `min_compress_bytes < 0`.
+- **Example**:
+  ```python
+  from blockchain_compression.compression import BlockCompressor
+
+  compressor = BlockCompressor(preset=6, min_compress_bytes=256)
+  ```
 
 ##### `compress_block(self, block_data: bytes) -> bytes`
 - **Description**: Encodes `block_data` with a 1-byte header (`FRAME_RAW = 0x00` when `len(block_data) < min_compress_bytes` or when `min_compress_bytes > 0` and LZMA does not shrink the payload; `FRAME_LZMA = 0x01` otherwise).
+- **Raises**: `TypeError` if `block_data` is not `bytes` or `bytearray`.
 
 ##### `decompress_block(self, compressed_block_data: bytes) -> bytes`
 - **Description**: Decodes framed (`0x00` / `0x01`) payloads or legacy unframed `LZMA_MAGIC` streams while enforcing `max_decompressed_bytes`, stream EOF, and absence of trailing bytes.
@@ -383,6 +410,15 @@ the prover knows an opening of a commitment, without revealing it. The key diffe
 the old mock: `verify_proof` takes only the commitment - never the plaintext message or
 blinding factor - which is what makes this actually zero-knowledge.
 
+### **Commitment**
+
+Frozen dataclass (`@dataclass(frozen=True)`) holding the Pedersen group element:
+- **`value: int`**: Group element $C = g^m \cdot h^r \bmod p$ in the order-$Q$ subgroup of $\mathbb{Z}_P^*$.
+
+##### `Commitment.to_dict()` / `Commitment.from_dict(data)` / `Commitment.to_bytes()` / `Commitment.from_bytes(data)`
+- **Description**: Canonical versioned (`version = 1`, `group = "rfc3526-modp-2048"`) serialization for `Commitment`. `to_dict()` encodes `value` as a fixed 512-char lowercase hex string; `to_bytes()` outputs 263 bytes (`b"BCPCOM\x01"` + 256-byte big-endian `value`).
+- **Raises**: `TypeError` for non-dict/non-bytes inputs or non-strict-`int` `value` (including `bool`); `ValueError` for invalid keys, headers, lengths, `(1, P)` range violations, or non-subgroup values.
+
 ### **PedersenCommitment**
 
 ##### `commit(self, message: int, blinding: int | None = None) -> tuple[Commitment, int]`
@@ -399,6 +435,17 @@ blinding factor - which is what makes this actually zero-knowledge.
 ##### `verify_opening(self, commitment: Commitment, message: int, blinding: int) -> bool`
 - **Description**: Checks that `(message, blinding)` is a valid opening of `commitment` - this reveals the message, unlike the Schnorr proof below.
 - **Raises**: `TypeError` if `commitment` is not a `Commitment` or if `commitment.value`, `message`, or `blinding` is not a strict `int` (`bool` is rejected). Returns `False` if any value is outside its valid range.
+
+### **SchnorrProof**
+
+Frozen dataclass (`@dataclass(frozen=True)`) representing a non-interactive Fiat-Shamir Schnorr proof of knowledge. Deliberately stores **only** the public proof transcript (`t`, `s1`, `s2`) — never `message` or `blinding`:
+- **`t: int`**: Commitment/announcement $t = g^{k_1} h^{k_2} \bmod p$ in the order-$Q$ subgroup.
+- **`s1: int`**: Response scalar $s_1 = (k_1 + e \cdot m) \bmod Q$ in `[0, Q)`.
+- **`s2: int`**: Response scalar $s_2 = (k_2 + e \cdot r) \bmod Q$ in `[0, Q)`.
+
+##### `SchnorrProof.to_dict()` / `SchnorrProof.from_dict(data)` / `SchnorrProof.to_bytes()` / `SchnorrProof.from_bytes(data)`
+- **Description**: Canonical versioned (`version = 1`, `group = "rfc3526-modp-2048"`) serialization for `SchnorrProof`. `to_dict()` encodes `t`, `s1`, `s2` as fixed 512-char lowercase hex strings; `to_bytes()` outputs 775 bytes (`b"BCPZKP\x01"` + three 256-byte big-endian integers).
+- **Raises**: `TypeError` for non-dict/non-bytes inputs or non-strict-`int` fields (`bool` rejected); `ValueError` for invalid keys, headers, lengths, scalar range violations, or non-subgroup `t`.
 
 ### Schnorr proof functions
 
@@ -432,12 +479,6 @@ blinding factor - which is what makes this actually zero-knowledge.
 
 ### Serialization & Optional Attachments
 
-##### `Commitment.to_dict()` / `Commitment.from_dict(data)` / `Commitment.to_bytes()` / `Commitment.from_bytes(data)`
-- **Description**: Canonical versioned (`version = 1`, `group = "rfc3526-modp-2048"`) serialization for `Commitment`. `to_dict()` encodes `value` as a fixed 512-char lowercase hex string; `to_bytes()` outputs 263 bytes (`b"BCPCOM\x01"` + 256-byte big-endian `value`). Deserializers enforce exact keys/headers/lengths, `(1, P)` bounds, and order-`Q` subgroup membership.
-
-##### `SchnorrProof.to_dict()` / `SchnorrProof.from_dict(data)` / `SchnorrProof.to_bytes()` / `SchnorrProof.from_bytes(data)`
-- **Description**: Canonical versioned (`version = 1`, `group = "rfc3526-modp-2048"`) serialization for `SchnorrProof`. `to_dict()` encodes `t`, `s1`, `s2` as fixed 512-char lowercase hex strings; `to_bytes()` outputs 775 bytes (`b"BCPZKP\x01"` + three 256-byte big-endian integers). Deserializers enforce exact keys/headers/lengths, scalar bounds, and order-`Q` subgroup membership for `t`.
-
 ##### `ZKAttachment(commitment, proof=None, tx_id=None, version=1)`
 - **Description**: Optional versioned container associating a `Commitment` (and optional `SchnorrProof` / `tx_id`) with a block. Provides `to_dict()`, `from_dict()`, and opt-in `verify(metrics=None)` (returns `False` when `proof is None`). Does not introduce confidential-transaction semantics or automatic ledger enforcement.
 
@@ -456,18 +497,22 @@ A thread-safe (protected by `threading.RLock`) in-process metrics registry: coun
 
 ##### `increment_counter(self, name, value=1.0, labels=None, help_text=None) -> None`
 - **Description**: Increments a monotonic counter. `value` must be a finite, non-negative number (`bool`, `NaN`, and `Infinity` are rejected); label keys must match `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+- **Raises**: `TypeError` for non-dict `labels`; `ValueError` for invalid metric/label names, kind mismatch, or negative/non-finite `value`.
 
 ##### `set_gauge(self, name, value, labels=None, help_text=None) -> None`
 - **Description**: Sets a point-in-time finite numeric value; label keys must match `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+- **Raises**: `TypeError` for non-dict `labels`; `ValueError` for invalid metric/label names, kind mismatch, or non-finite/`bool` `value`.
 
 ##### `observe_histogram(self, name, value, labels=None, help_text=None, buckets=None) -> None`
 - **Description**: Records one finite observation into cumulative buckets (`buckets` only takes effect on a metric's first observation). Rejects the reserved label name `"le"` in `labels`.
+- **Raises**: `TypeError` for non-dict `labels`; `ValueError` for reserved `"le"` label, invalid names, kind mismatch, or non-finite/`bool` `value`.
 
 ##### `get_counter(self, name, labels=None) -> float | None` / `get_gauge(self, name, labels=None) -> float | None` / `get_histogram(self, name, labels=None) -> HistogramSnapshot | None`
 - **Description**: Public read-only accessors returning the recorded series value (or an immutable `HistogramSnapshot` with `count`, `sum`, and read-only `MappingProxyType` `buckets`), or `None` if unrecorded without registering a metric.
 
 ##### `to_json(self, indent: int | None = 2) -> str`
 - **Description**: A structured snapshot of every metric family as one strict RFC 8259 JSON document (`allow_nan=False`).
+- **Raises**: `ValueError` if non-finite values were injected internally.
 
 ##### `to_prometheus_text(self) -> str`
 - **Description**: Hand-rolled Prometheus text exposition format (`# HELP`/`# TYPE` lines, cumulative `_bucket`/`_sum`/`_count` series for histograms) - no `prometheus_client` dependency.
@@ -482,3 +527,11 @@ A thread-safe (protected by `threading.RLock`) in-process metrics registry: coun
   chain = Chain(metrics=metrics)
   print(metrics.to_prometheus_text())
   ```
+
+---
+
+## CLI Entry Point
+
+### **`main(argv: list[str] | None = None) -> None`**
+- **Description**: Runs the end-to-end demo workflow (chain creation, Merkle inclusion proof, SQLite WAL persistence + pruning + compaction, reload validation, Pedersen + Schnorr ZK round-trip, and JSON/Prometheus metrics export). Accepts `--max-full-blocks <N>` (`>= 1`, default `2`) and optional `--db-path <path>`.
+- **Raises**: `SystemExit` on invalid CLI arguments or `--help`.

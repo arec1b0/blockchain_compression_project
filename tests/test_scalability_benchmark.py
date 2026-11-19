@@ -1,5 +1,6 @@
 # test_scalability_benchmark.py
 
+from blockchain_compression.benchmarks import scalability_benchmark as scale_bench
 from blockchain_compression.benchmarks.scalability_benchmark import (
     benchmark_block_compression,
     benchmark_chain_append,
@@ -55,3 +56,56 @@ def test_scalability_benchmark_functions_smoke():
     zk_res = benchmark_zk(repeats=1)
     assert zk_res.backend == "python"
     assert zk_res.gen_mean_ms > 0 and zk_res.ver_mean_ms > 0
+
+
+def test_scalability_benchmark_main_fast(monkeypatch, caplog):
+    monkeypatch.setattr(
+        scale_bench,
+        "benchmark_serialization",
+        lambda: benchmark_serialization(
+            sizes=(("small(1tx)", 1), ("medium(10tx)", 10)),
+            repeats=1,
+        ),
+    )
+    monkeypatch.setattr(
+        scale_bench,
+        "benchmark_block_compression",
+        lambda: benchmark_block_compression(
+            sizes=(("small(1tx)", 1, 1), ("large(40tx)", 40, 1)),
+            configs=((1, 256), (6, 0)),
+        ),
+    )
+    monkeypatch.setattr(
+        scale_bench,
+        "benchmark_chain_append",
+        lambda: benchmark_chain_append(heights=(10,), sample_blocks=5),
+    )
+    monkeypatch.setattr(
+        scale_bench,
+        "benchmark_incremental_pruning",
+        lambda: benchmark_incremental_pruning(
+            noop_height=15,
+            noop_calls=5,
+            growth_heights=(10,),
+        ),
+    )
+    monkeypatch.setattr(
+        scale_bench,
+        "benchmark_sqlite_store",
+        lambda: benchmark_sqlite_store(
+            num_blocks=10,
+            overflow_blocks=6,
+            overflow_txs_per_block=100,
+            cache_probe_txs=20,
+            cache_limit=5,
+        ),
+    )
+    monkeypatch.setattr(scale_bench, "benchmark_zk", lambda: benchmark_zk(repeats=1))
+
+    with caplog.at_level("INFO"):
+        scale_bench.main()
+
+    assert "JSON Serialization" in caplog.text
+    assert "Block Compression & Framing" in caplog.text
+    assert "SQLite ChainStore & Bounded Replay Cache" in caplog.text
+    assert "ZK Throughput" in caplog.text

@@ -96,7 +96,7 @@ class HistogramSnapshot:
 class MetricsRegistry:
     """Thread-safe in-process metrics registry: counters, gauges, and histograms."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock = threading.RLock()
         self._counters: dict[tuple, float] = {}
         self._gauges: dict[tuple, float] = {}

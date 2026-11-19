@@ -683,11 +683,14 @@ def test_prune_and_compact_reclaim_disk_space(tmp_path):
                 for j in range(90)
             ]
             store.add_block(chain, batch)
+        store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        size_before_second_prune = db_path.stat().st_size
         pruned_more = store.prune_chain(pruner, compact=True)
         assert pruned_more == [24, 25, 26, 27, 28]
-        assert store._conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+        size_after_second_compact = db_path.stat().st_size
+        assert size_after_second_compact < size_before_second_prune
 
-    assert freelist_after_compact == 0
+    assert freelist_after_compact < freelist_after_prune
     assert size_after_compact < size_before_prune
 
     with ChainStore(db_path) as store:

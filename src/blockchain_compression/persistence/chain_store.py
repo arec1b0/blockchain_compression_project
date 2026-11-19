@@ -365,15 +365,20 @@ class ChainStore:
             if isinstance(pages, bool) or not isinstance(pages, int) or pages < 1:
                 raise ValueError("pages must be a positive integer")
 
+        if self._conn.in_transaction:
+            raise RuntimeError("cannot compact while a transaction is active")
+
         if full:
             self._conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
             self._conn.execute("VACUUM")
         else:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            # executescript() steps PRAGMA incremental_vacuum to SQLITE_DONE even
+            # on Python 3.10/3.11, where cursor.fetchall() stops after 1 page
+            # because PRAGMA incremental_vacuum yields 0-column rows.
             if pages is None:
-                self._conn.execute("PRAGMA incremental_vacuum").fetchall()
+                self._conn.executescript("PRAGMA incremental_vacuum;")
             else:
-                self._conn.execute(f"PRAGMA incremental_vacuum({pages})").fetchall()
+                self._conn.executescript(f"PRAGMA incremental_vacuum({pages});")
         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
 
     def append_block(self, block: Block, applied_tx_ids, updated_accounts: dict) -> None:

@@ -665,7 +665,11 @@ def test_prune_and_compact_reclaim_disk_space(tmp_path):
         pruned = store.prune_chain(pruner, compact=False)
         assert len(pruned) == 24
         freelist_after_prune = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
-        assert freelist_after_prune > 0
+        assert freelist_after_prune > 5
+
+        store.compact(pages=5)
+        freelist_after_partial = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert freelist_after_partial == freelist_after_prune - 5
 
         store.compact()
         freelist_after_compact = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
@@ -688,9 +692,10 @@ def test_prune_and_compact_reclaim_disk_space(tmp_path):
         pruned_more = store.prune_chain(pruner, compact=True)
         assert pruned_more == [24, 25, 26, 27, 28]
         size_after_second_compact = db_path.stat().st_size
+        assert store._conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
         assert size_after_second_compact < size_before_second_prune
 
-    assert freelist_after_compact < freelist_after_prune
+    assert freelist_after_compact == 0
     assert size_after_compact < size_before_prune
 
     with ChainStore(db_path) as store:

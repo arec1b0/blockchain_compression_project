@@ -783,12 +783,15 @@ def test_concurrent_wal_readers_and_writer_without_sqlite_busy(tmp_path):
         store.add_block(chain, [_tx("tx-seed", "Alice", 1)])
 
     stop_event = threading.Event()
+    readers_ready = threading.Barrier(3)
     errors: list[BaseException] = []
     observed_heights: list[int] = []
+    heights_lock = threading.Lock()
 
     def _writer():
         try:
             with ChainStore(db_path) as writer_store:
+                readers_ready.wait(timeout=5)
                 for i in range(40):
                     writer_store.add_block(chain, [_tx(f"tx-w-{i}", "Alice", 1)])
         except BaseException as exc:  # pragma: no cover - surfaced by assertion
@@ -799,8 +802,13 @@ def test_concurrent_wal_readers_and_writer_without_sqlite_busy(tmp_path):
     def _reader():
         try:
             with ChainStore(db_path) as reader_store:
+                readers_ready.wait(timeout=5)
                 while not stop_event.is_set():
                     snap = reader_store.load_chain(validate=True)
+                    with heights_lock:
+                        observed_heights.append(len(snap))
+                snap = reader_store.load_chain(validate=True)
+                with heights_lock:
                     observed_heights.append(len(snap))
         except BaseException as exc:  # pragma: no cover - surfaced by assertion
             errors.append(exc)

@@ -368,10 +368,12 @@ class ChainStore:
         if full:
             self._conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
             self._conn.execute("VACUUM")
-        elif pages is None:
-            self._conn.execute("PRAGMA incremental_vacuum").fetchall()
         else:
-            self._conn.execute(f"PRAGMA incremental_vacuum({pages})").fetchall()
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            if pages is None:
+                self._conn.execute("PRAGMA incremental_vacuum").fetchall()
+            else:
+                self._conn.execute(f"PRAGMA incremental_vacuum({pages})").fetchall()
         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
 
     def append_block(self, block: Block, applied_tx_ids, updated_accounts: dict) -> None:

@@ -9,9 +9,9 @@ Run with ``blockchain-compress-bench-merkle`` or
 
 import logging
 import math
-import time
 from dataclasses import dataclass
 
+from blockchain_compression.benchmarks.timing import best_time
 from blockchain_compression.merkle import MerkleTree
 
 logger = logging.getLogger(__name__)
@@ -32,15 +32,6 @@ class MerkleBenchResult:
         return math.ceil(math.log2(self.num_transactions))
 
 
-def _best_time(func, repeats: int) -> float:
-    best = float("inf")
-    for _ in range(repeats):
-        start = time.perf_counter()
-        func()
-        best = min(best, time.perf_counter() - start)
-    return best
-
-
 def benchmark_size(num_transactions: int, repeats: int = 3) -> MerkleBenchResult:
     """Benchmark proof generation/verification for a tree of ``num_transactions`` leaves."""
     transactions = [f"tx-{i}" for i in range(num_transactions)]
@@ -55,8 +46,8 @@ def benchmark_size(num_transactions: int, repeats: int = 3) -> MerkleBenchResult
     return MerkleBenchResult(
         num_transactions=num_transactions,
         proof_length=len(proof),
-        get_proof_seconds=_best_time(lambda: tree.get_proof(probe_index), repeats),
-        verify_seconds=_best_time(
+        get_proof_seconds=best_time(lambda: tree.get_proof(probe_index), repeats),
+        verify_seconds=best_time(
             lambda: MerkleTree.verify_proof(transactions[probe_index], proof, root), repeats
         ),
     )

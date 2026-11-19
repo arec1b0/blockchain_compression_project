@@ -9,6 +9,49 @@ different, unverified group instead of a loud failure.
 """
 
 import hashlib
+import logging
+import os
+from collections.abc import Callable
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_modexp_backend(
+    backend: str | None = None,
+) -> tuple[str, Callable[[int, int, int], int]]:
+    """Select modular exponentiation backend (pure Python by default).
+
+    Setting ``BLOCKCHAIN_COMPRESSION_ZK_BACKEND=gmpy2`` opts into ``gmpy2.powmod``
+    when the optional ``gmpy2`` package is installed, falling back cleanly to
+    built-in ``pow()`` if absent. Neither backend alters group parameters or proof
+    formats.
+    """
+    raw_choice = (
+        os.environ.get("BLOCKCHAIN_COMPRESSION_ZK_BACKEND", "python")
+        if backend is None
+        else backend
+    )
+    selected = raw_choice.strip().lower() or "python"
+    if selected == "python":
+        return "python", pow
+    if selected == "gmpy2":
+        try:
+            import gmpy2  # type: ignore[import-not-found]
+        except ImportError:
+            logger.warning(
+                "BLOCKCHAIN_COMPRESSION_ZK_BACKEND=gmpy2 requested, "
+                "but gmpy2 is not installed; falling back to pure-Python pow()."
+            )
+            return "python", pow
+
+        def _gmpy2_powmod(base: int, exp: int, mod: int) -> int:
+            return int(gmpy2.powmod(base, exp, mod))
+
+        return "gmpy2", _gmpy2_powmod
+    raise ValueError(f"unsupported ZK modular exponentiation backend: {selected!r}")
+
+
+ZK_MODEXP_BACKEND, powmod = resolve_modexp_backend()
 
 # RFC 3526 section 3, "2048-bit MODP Group" (id 14): a standardized, publicly
 # documented "nothing up my sleeve" prime derived from the digits of pi.
@@ -41,7 +84,7 @@ G = 2
 # problem, which is the whole point of a nothing-up-my-sleeve generator.
 _H_SEED = b"blockchain-compression-project/pedersen-h/v1"
 _h_candidate = int(hashlib.sha256(_H_SEED).hexdigest(), 16) % P
-H = pow(_h_candidate, 2, P)
+H = powmod(_h_candidate, 2, P)
 
 
 def _verify_group_parameters() -> None:
@@ -50,9 +93,9 @@ def _verify_group_parameters() -> None:
     ``python -O`` strips) - this check must never be skippable."""
     if P.bit_length() != 2048:
         raise RuntimeError("P is not a 2048-bit prime - possible transcription error")
-    if pow(G, Q, P) != 1:
+    if powmod(G, Q, P) != 1:
         raise RuntimeError("G does not generate the order-Q subgroup")
-    if pow(H, Q, P) != 1:
+    if powmod(H, Q, P) != 1:
         raise RuntimeError("H does not generate the order-Q subgroup")
     if H in (0, 1):
         raise RuntimeError("degenerate H")

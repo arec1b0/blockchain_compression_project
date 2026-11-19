@@ -10,9 +10,9 @@ Run with ``blockchain-compress-bench`` or
 import json
 import logging
 import random
-import time
 from dataclasses import dataclass
 
+from blockchain_compression.benchmarks.timing import best_time
 from blockchain_compression.compression import BlockCompressor
 
 logger = logging.getLogger(__name__)
@@ -79,15 +79,6 @@ DATASETS = {
 }
 
 
-def _best_time(func, repeats: int) -> float:
-    best = float("inf")
-    for _ in range(repeats):
-        start = time.perf_counter()
-        func()
-        best = min(best, time.perf_counter() - start)
-    return best
-
-
 def benchmark_dataset(name: str, data: bytes, preset: int, repeats: int = 3) -> BenchmarkResult:
     """Benchmark one dataset at one LZMA preset, verifying the round trip."""
     compressor = BlockCompressor(preset=preset)
@@ -99,8 +90,8 @@ def benchmark_dataset(name: str, data: bytes, preset: int, repeats: int = 3) -> 
         preset=preset,
         original_size=len(data),
         compressed_size=len(compressed),
-        compress_seconds=_best_time(lambda: compressor.compress_block(data), repeats),
-        decompress_seconds=_best_time(lambda: compressor.decompress_block(compressed), repeats),
+        compress_seconds=best_time(lambda: compressor.compress_block(data), repeats),
+        decompress_seconds=best_time(lambda: compressor.decompress_block(compressed), repeats),
     )
 
 

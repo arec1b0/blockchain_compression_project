@@ -100,3 +100,40 @@ def test_malformed_proof_step_raises():
         MerkleTree.verify_proof("tx1", [{"hash": root}], root)
     with pytest.raises(ValueError):
         MerkleTree.verify_proof("tx1", [{"hash": root, "position": "up"}], root)
+    with pytest.raises(ValueError):
+        MerkleTree.verify_proof("tx1", [{"hash": "not-hex", "position": "right"}], root)
+    with pytest.raises(ValueError):
+        MerkleTree.verify_proof("tx1", [{"hash": "ab" * 31, "position": "right"}], root)
+    with pytest.raises(ValueError):
+        MerkleTree.verify_proof("tx1", [{"hash": root + "\n", "position": "right"}], root)
+    with pytest.raises(TypeError):
+        MerkleTree.verify_proof("tx1", [{"hash": 123, "position": "right"}], root)
+
+
+def test_malformed_root_raises():
+    tree = MerkleTree(["tx1", "tx2"])
+    proof = tree.get_proof(0)
+    with pytest.raises(TypeError):
+        MerkleTree.verify_proof("tx1", proof, 123)
+    with pytest.raises(ValueError):
+        MerkleTree.verify_proof("tx1", proof, "not-a-hex-digest")
+    with pytest.raises(ValueError):
+        MerkleTree.verify_proof("tx1", proof, "ab" * 31)
+    with pytest.raises(ValueError):
+        MerkleTree.verify_proof("tx1", proof, " " * 64)
+
+
+def test_uppercase_hex_root_and_step_verify():
+    tree = MerkleTree(["tx1", "tx2"])
+    root = tree.get_root()
+    proof = tree.get_proof(0)
+    upper_proof = [{"hash": proof[0]["hash"].upper(), "position": proof[0]["position"]}]
+    assert MerkleTree.verify_proof("tx1", upper_proof, root.upper())
+
+
+def test_hash_node_validates_digests():
+    valid = MerkleTree.hash_leaf("a")
+    with pytest.raises(TypeError):
+        MerkleTree.hash_node(123, valid)
+    with pytest.raises(ValueError):
+        MerkleTree.hash_node("bad", valid)

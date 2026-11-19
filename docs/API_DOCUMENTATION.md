@@ -38,11 +38,9 @@ being pruned away.
 
 #### **Methods:**
 
-##### `Block.create(index: int, prev_hash: str, transactions: list, timestamp: float | None = None) -> Block`
-- **Description**: Classmethod. Builds a fresh block from raw transactions. The Merkle root
-  and the compressed body are derived from the same canonical per-transaction JSON strings,
-  so a decompressed body is always guaranteed to reproduce `merkle_root`.
-- **Raises**: `TypeError` if `transactions` is not a list.
+##### `Block.create(index: int, prev_hash: str, transactions: list, timestamp: float | None = None, zk_attachments: Iterable[ZKAttachment] | None = None, compressor: BlockCompressor | None = None) -> Block`
+- **Description**: Classmethod. Builds a fresh block from raw transactions. Each transaction is serialized once via `canonical_json(tx)` to compute both the Merkle root and `"[" + ",".join(tx_strings) + "]"` without re-serializing the full transaction list. Transactions are deep-copied via JSON round-tripping so caller mutations cannot desynchronize the block body. Optional `compressor` selects preset and framing thresholds; optional `zk_attachments` are structurally validated without altering header hashes.
+- **Raises**: `TypeError` if `transactions` is not a list or `compressor` is not a `BlockCompressor` / `None`.
 - **Example**:
   ```python
   from blockchain_compression.chain import Block
@@ -54,9 +52,10 @@ being pruned away.
 
 ##### `Block.from_persisted(*, index, prev_hash, merkle_root, hash, timestamp, compressed_body, is_pruned) -> Block`
 - **Description**: Classmethod. Reconstructs a block from trusted storage *without*
-  recomputing its hash - used by `ChainStore.load_chain()`. A decompression/parse failure
-  on a present body is swallowed (`transactions` stays `None`) rather than raised, so it
-  surfaces as a `verify_body()` failure instead of crashing the reload.
+  recomputing its hash - used by `ChainStore.load_chain()`. A decompression/parse/shape
+  failure (including non-list JSON) on a present body is swallowed (`transactions` stays
+  `None`) rather than raised, so it surfaces as a `verify_body()` failure instead of
+  crashing the reload.
 
 ##### `prune(self) -> None`
 - **Description**: Drops the body (`transactions` and `compressed_body` become `None`,
@@ -64,9 +63,11 @@ being pruned away.
   verifiable. The only method that may mutate a `Block` after construction.
 
 ##### `verify_body(self) -> bool`
-- **Description**: `True` trivially for a pruned block. `False` if the body is missing
-  without being marked pruned (corruption), or if a present body's content doesn't
-  reproduce `merkle_root` (tampering). Never raises on bad data.
+- **Description**: `True` for a properly pruned block (`compressed_body` and `transactions`
+  are both `None`). `False` if a pruned block still carries body/transaction data, if an
+  unpruned block's body is missing or `transactions` is not a list (corruption), or if a
+  present body's content doesn't reproduce `merkle_root` (tampering). Never raises on bad
+  data.
 
 ##### `Block.compute_hash(index, prev_hash, merkle_root, timestamp) -> str`
 - **Description**: Static method. SHA-256 over the canonical header fields - the one place
@@ -81,9 +82,11 @@ cumulative account state.
 
 #### **Methods:**
 
-##### `__init__(self, state: StateDelta | None = None, metrics: MetricsRegistry | None = None)`
+##### `__init__(self, state: StateDelta | None = None, metrics: MetricsRegistry | None = None, compressor: BlockCompressor | None = None)`
 - **Description**: Creates a chain with a genesis block. `state` defaults to a fresh
-  `StateDelta`; `metrics` defaults to `None` (no metrics recorded).
+  `StateDelta`; `metrics` defaults to `None` (no metrics recorded); optional `compressor`
+  configures block compression preset and threshold for newly appended blocks (exposed via the
+  read-only `compressor` property).
 - **Example**:
   ```python
   from blockchain_compression.chain import Chain
@@ -91,33 +94,55 @@ cumulative account state.
   chain = Chain()
   ```
 
-##### `add_block(self, transactions: list) -> Block`
-- **Description**: Validates every transaction (via `StateDelta.validate_transaction`)
-  *before* applying any of them, then applies them all and appends the new block. A
-  malformed transaction later in the batch can't leave state partially mutated with no
-  corresponding block. Records `blocks_added_total` and a per-block `compression_ratio`
-  gauge if `metrics` was provided.
-- **Raises**: `TypeError` if `transactions` isn't a list; whatever `StateDelta.validate_transaction` raises for a malformed transaction.
+##### `add_block(self, transactions: list, zk_attachments: Iterable[ZKAttachment] | None = None) -> Block`
+- **Description**: Validates every transaction (via `StateDelta.stage_batch`) and rejects
+  duplicate or already-applied `tx_id`s in `O(len(transactions))` *before* creating a block or
+  mutating state, then stages and commits via `prepare_block()` / `commit_block()`. Optional
+  `zk_attachments` are structurally validated and stored on the block without altering header
+  hashes or mandatory chain rules. When `metrics` is supplied, records constant-cardinality
+  metrics (`blocks_added_total`, `block_raw_bytes_total`, `block_compressed_bytes_total`,
+  `last_block_compression_ratio` gauge, and `block_compression_ratio` histogram).
+- **Raises**: `TypeError` if `transactions` isn't a list or `zk_attachments` contains non-`ZKAttachment` values; `ValueError` for duplicate/replayed `tx_id`s or whatever `StateDelta.validate_transaction` / balance bounds raise.
 - **Example**:
   ```python
   block = chain.add_block([{"tx_id": "tx-1", "account": "Alice", "amount": 100}])
   ```
 
+##### `prepare_block(self, transactions: list, zk_attachments: Iterable[ZKAttachment] | None = None) -> PreparedBlock`
+- **Description**: Stages a prospective block, batch `BlockDelta` (`prepared.delta`), and raw serialized byte count in `O(len(transactions))` without mutating chain state or copying full history. Used with `commit_block()` by coordinated persistence layers such as `ChainStore`.
+
+##### `commit_block(self, prepared: PreparedBlock) -> Block`
+- **Description**: Commits a `PreparedBlock` produced by `prepare_block()` using `O(len(delta.tx_ids))` state delta application, raising `ValueError` if the chain tip changed since preparation.
+
+##### `Chain.from_persisted(blocks, state, metrics=None, compressor=None) -> Chain`
+- **Description**: Classmethod. Reconstructs a `Chain` directly from persisted `Block` objects and a hydrated `StateDelta` without creating or compressing a throwaway genesis block.
+
 ##### `validate_chain(self, check_bodies: bool = True) -> bool`
 - **Description**: Walks the chain checking index continuity, `prev_hash` linkage,
   header-hash recomputation, and (if `check_bodies`) that every non-pruned block's body
-  still matches its header via `Block.verify_body()`.
+  still matches its header via `Block.verify_body()`. Does *not* enforce optional
+  `zk_attachments`; use `verify_zk_attachments()` for opt-in verification.
 - **Example**:
   ```python
   assert chain.validate_chain()
   ```
 
+##### `verify_zk_attachments(self, metrics: MetricsRegistry | None = None) -> bool`
+- **Description**: Opt-in helper that verifies every optional `ZKAttachment` across all blocks in the chain (returns `False` if any attachment lacks a proof or fails verification).
+
 ##### `get_block(self, index: int) -> Block`
 - **Description**: Returns the block at `index`.
 - **Raises**: `IndexError` if out of range.
 
+##### `blocks` (property) -> `tuple[Block, ...]`
+- **Description**: Read-only tuple view of blocks in the chain, genesis-first.
+
 ##### `state` (property) -> `StateDelta`
-- **Description**: The chain's cumulative account state.
+- **Description**: The chain's cumulative account state (for inspection). Direct mutation
+  outside `add_block()` is unsupported; call `get_state_snapshot()` for an isolated copy.
+
+##### `get_state_snapshot(self) -> StateDelta`
+- **Description**: Returns an independent copy of the chain's current `StateDelta`.
 
 ##### `__len__(self)` / `__iter__(self)`
 - **Description**: Number of blocks (including genesis); iterates blocks oldest-first.
@@ -128,32 +153,20 @@ cumulative account state.
 
 ### **BlockCompressor**
 
-The `BlockCompressor` class provides functionality to compress and decompress blockchain block data using the LZMA algorithm.
+The `BlockCompressor` class encodes and decodes block bodies using size-aware framing (`FRAME_RAW = 0x00` or `FRAME_LZMA = 0x01`), while preserving backward compatibility with legacy unframed LZMA streams (`LZMA_MAGIC = b"\xfd7zXZ\x00"`).
 
 #### **Methods:**
 
+##### `__init__(self, preset: int = 1, max_decompressed_bytes: int = 16 * 1024 * 1024, min_compress_bytes: int = 256)`
+- **Description**: Initializes the block compressor with LZMA `preset` (`0`–`9`, default `DEFAULT_PRESET = 1`), output cap `max_decompressed_bytes` (default `16 MiB`), and size threshold `min_compress_bytes` (default `DEFAULT_COMPRESSION_THRESHOLD = 256` bytes; pass `0` to force `FRAME_LZMA` for all inputs).
+- **Raises**: `ValueError` if `preset` is outside `0..9`, `max_decompressed_bytes < 1`, or `min_compress_bytes < 0`.
+
 ##### `compress_block(self, block_data: bytes) -> bytes`
-- **Description**: Compresses the raw blockchain block data using the LZMA algorithm.
-- **Parameters**: 
-  - `block_data` (bytes): The raw data of the blockchain block to be compressed.
-- **Returns**: 
-  - Compressed block data (bytes).
-- **Example**:
-  ```python
-  compressor = BlockCompressor()
-  compressed_data = compressor.compress_block(b"Sample blockchain block data")
-  ```
+- **Description**: Encodes `block_data` with a 1-byte header (`FRAME_RAW = 0x00` when `len(block_data) < min_compress_bytes` or when `min_compress_bytes > 0` and LZMA does not shrink the payload; `FRAME_LZMA = 0x01` otherwise).
 
 ##### `decompress_block(self, compressed_block_data: bytes) -> bytes`
-- **Description**: Decompresses the compressed blockchain block data back to its original form.
-- **Parameters**: 
-  - `compressed_block_data` (bytes): The compressed block data.
-- **Returns**: 
-  - Decompressed block data (bytes).
-- **Example**:
-  ```python
-  decompressed_data = compressor.decompress_block(compressed_data)
-  ```
+- **Description**: Decodes framed (`0x00` / `0x01`) payloads or legacy unframed `LZMA_MAGIC` streams while enforcing `max_decompressed_bytes`, stream EOF, and absence of trailing bytes.
+- **Raises**: `TypeError` if input is not `bytes`/`bytearray`; `ValueError` if empty, unknown frame byte, corrupted, truncated, trailing data is present, or output exceeds `max_decompressed_bytes`.
 
 ---
 
@@ -161,20 +174,32 @@ The `BlockCompressor` class provides functionality to compress and decompress bl
 
 ### **StateDelta**
 
-The `StateDelta` class handles the storage and management of state changes (deltas) in the blockchain. Instead of storing the full state, it keeps only the changes applied by each transaction.
+The `StateDelta` class handles the storage and management of state changes (deltas) in the blockchain. Replay protection uses an unbounded set by default for standalone usage, or an optional bounded LRU cache (`max_applied_tx_ids`) backed by a `tx_lookup` callable (such as `ChainStore.has_applied_tx`).
 
 #### **Methods:**
 
-##### `apply_transaction(self, transaction: dict) -> dict`
-- **Description**: Applies a transaction to the blockchain state and stores only the delta (difference). Application is **idempotent**: replaying a transaction with an already-applied `tx_id` is a no-op and returns an empty dict.
+##### `__init__(self, *, max_applied_tx_ids: int | None = None, tx_lookup: Callable[[str], bool] | None = None)`
+- **Description**: Initializes state balances and replay tracking. Setting `max_applied_tx_ids` (`>= 0`) requires a callable `tx_lookup` so evictions never weaken replay detection.
+
+##### `stage_batch(self, transactions: list[dict]) -> BlockDelta` / `commit_delta(self, delta: BlockDelta, *, check_backing_lookup: bool = True) -> None`
+- **Description**: Validate and apply transaction batches in `O(len(transactions))` without full-history state or `applied_tx_ids` copies.
+
+##### `configure_applied_tx_cache(self, max_size: int | None, tx_lookup: Callable[[str], bool] | None = None) -> None` / `copy(self) -> StateDelta` / `get_balance(self, account: str) -> int`
+- **Description**: Attaches or resizes the bounded LRU replay cache, clones state cleanly, and queries a single account's balance without copying `current_state`. Read-only properties `is_applied_tx_cache_bounded`, `cached_applied_tx_count`, `has_evicted_tx_ids`, and `max_applied_tx_ids` inspect cache configuration and occupancy.
+
+##### `apply_transaction(self, transaction: dict) -> dict[str, int]`
+- **Description**: Applies a transaction to the blockchain state in exact signed 64-bit
+  integer base units (`[-2**63, 2**63 - 1]`) and stores only the delta (difference).
+  Direct calls to `apply_transaction` remain **idempotent**: replaying a transaction with an
+  already-applied `tx_id` is a no-op and returns an empty dict.
 - **Parameters**: 
   - `transaction` (dict): A dictionary representing the transaction to apply. Must contain the keys:
     - `tx_id`: A unique, non-empty string identifying the transaction (used for replay protection).
     - `account`: The account to update (non-empty string).
-    - `amount`: The numeric change to apply to the account.
+    - `amount`: An exact `int` (not `bool`, `float`, or `Decimal`) change in `[-2**63, 2**63 - 1]`.
 - **Returns**: 
   - A dictionary representing the delta (difference) applied to the state, or `{}` if the transaction was already applied.
-- **Raises**: `TypeError` / `ValueError` if the transaction is malformed.
+- **Raises**: `TypeError` / `ValueError` if the transaction is malformed or resulting balance overflows signed 64-bit bounds.
 - **Example**:
   ```python
   from blockchain_compression.compression import StateDelta
@@ -182,6 +207,12 @@ The `StateDelta` class handles the storage and management of state changes (delt
   state_delta = StateDelta()
   delta = state_delta.apply_transaction({'tx_id': 'tx-001', 'account': 'Alice', 'amount': 100})
   ```
+
+##### `is_applied(self, tx_id: str) -> bool`
+- **Description**: Returns `True` if `tx_id` has already been applied to this state.
+
+##### `StateDelta.validate_balance(value, *, field: str = "balance") -> None`
+- **Description**: Static method. Raises `ValueError` if `value` is not an exact `int` (excluding `bool`) within `[-2**63, 2**63 - 1]`.
 
 ##### `get_current_state(self) -> dict`
 - **Description**: Returns the current full state of the blockchain.
@@ -200,6 +231,9 @@ The `StateDelta` class handles the storage and management of state changes (delt
   ```python
   hydrated = StateDelta.from_snapshot({"Alice": 100}, {"tx-001"})
   ```
+
+##### `extract_block_delta(transactions: list[dict], state: StateDelta) -> BlockDelta`
+- **Description**: Shared utility returning a frozen `BlockDelta(tx_ids, accounts, updated_accounts)` summarizing the transaction IDs and updated account balances for persistence (used by `ChainStore.add_block()` and `main._sync_block()`). Raises `KeyError` if an account referenced in `transactions` is missing from `state`.
 
 ---
 
@@ -236,8 +270,9 @@ The `MerkleTree` class constructs a Merkle tree from a list of transactions and 
   - A list of proof steps `{"hash": <hex digest>, "position": "left" | "right"}`, where `position` is the side of the sibling hash.
 - **Raises**: `IndexError` if `index` is out of range.
 
-##### `verify_proof(cls, transaction: str, proof: list, root: str) -> bool`
+##### `verify_proof(cls, transaction: str, proof: list, root: str | None) -> bool`
 - **Description**: Classmethod. Verifies that `transaction` is committed under `root` using `proof`. Does not require the full tree.
+- **Validation & Errors**: Raises `TypeError` if `transaction` is not a `str`, `proof` is not a `list`, `root` is not `str | None`, or a step `'hash'` is not a `str`. Raises `ValueError` if `root` (when non-`None`) or any step `'hash'` is not a 64-character hex digest, if a proof step dict lacks `'hash'`/`'position'`, or if `'position'` is not `'left'` or `'right'`. Returns `False` when `root is None` or when the derived root mismatches `root`.
 - **Example**:
   ```python
   assert MerkleTree.verify_proof("tx3", proof, root_hash)
@@ -268,8 +303,11 @@ full bodies for only the most recent blocks; older blocks keep their header (so
   pruner = BlockchainPruner(chain, max_full_blocks=10)
   ```
 
-##### `prune(self) -> list`
-- **Description**: Prunes every not-yet-pruned block older than the last `max_full_blocks`. Returns the list of newly-pruned block indices (empty if none qualified). Records `pruning_events_total` / `blocks_pruned_total` if `metrics` was provided.
+##### `eligible_block_indices(self) -> list[int]`
+- **Description**: Returns the ordered list of unpruned block indices older than the trailing `max_full_blocks` window, scanning incrementally from `next_unpruned_index` so already-pruned prefixes are skipped cleanly. Shared by both `BlockchainPruner.prune()` and `ChainStore.prune_chain()`.
+
+##### `prune(self) -> list[int]` / `next_unpruned_index` / `reset_cursor() -> None`
+- **Description**: `prune()` drops bodies for every block returned by `eligible_block_indices()`, advances `next_unpruned_index`, and records `pruning_events_total` / `blocks_pruned_total` when `metrics` is supplied. `reset_cursor()` resets the incremental cursor (used automatically on `ChainStore.prune_chain()` rollback).
 - **Example**:
   ```python
   pruned_indices = pruner.prune()
@@ -282,46 +320,51 @@ full bodies for only the most recent blocks; older blocks keep their header (so
 
 ### **ChainStore**
 
-SQLite-backed persistence for a `Chain`. Three tables back a round-trippable chain:
-`blocks` (headers + optional body), `state_snapshot` (current account balances), and
-`applied_tx_ids` (replay-protection membership). The latter two aren't a cache: once a
-block is pruned, they're the *only* surviving record of what its transactions did.
+SQLite-backed persistence for a `Chain`. Four tables back a round-trippable chain at schema version `2`:
+`blocks` (headers + optional body), `state_snapshot` (current account balances),
+`applied_tx_ids` (replay-protection membership), and optional `zk_attachments`. `state_snapshot` and `applied_tx_ids` aren't a cache: once a block is pruned, they're the *only* surviving record of what its transactions did.
 
 #### **Methods:**
 
-##### `__init__(self, path: str | Path)`
-- **Description**: Opens (creating if needed) a SQLite database at `path` and ensures the schema exists. Also usable as a context manager (`with ChainStore(path) as store:`).
+##### `__init__(self, path: str | Path, *, busy_timeout_ms: int = 5000, synchronous: str = "NORMAL", max_cached_tx_ids: int | None = 10_000)`
+- **Description**: Opens (creating if needed) a SQLite database at `path` configured with `PRAGMA auto_vacuum = INCREMENTAL`, `PRAGMA journal_mode = WAL`, `PRAGMA busy_timeout = busy_timeout_ms`, `PRAGMA synchronous = synchronous`, and `PRAGMA foreign_keys = ON`. Ensures schema version `2` exists (`state_snapshot.balance` as exact `INTEGER`, plus optional `zk_attachments`), automatically migrating v0 and v1 databases. `max_cached_tx_ids` bounds the in-memory replay LRU cache when persisting or reloading chains. Also usable as a context manager (`with ChainStore(path) as store:`).
+
+##### `compact(self, *, pages: int | None = None, full: bool = False) -> None`
+- **Description**: Reclaims freelist pages left by logical pruning (`PRAGMA incremental_vacuum` + `PRAGMA wal_checkpoint(TRUNCATE)`). Pass `full=True` to run `PRAGMA auto_vacuum = INCREMENTAL` + a blocking `VACUUM` (required once on pre-existing databases without incremental auto-vacuum, or to coalesce sparse `<1 KiB` inline leaf pages).
+
+##### `has_applied_tx(self, tx_id: str) -> bool` / `applied_tx_count(self) -> int`
+- **Description**: Query SQLite's indexed `applied_tx_ids` table directly; `has_applied_tx` raises `RuntimeError` if called after the store closes.
 
 ##### `append_block(self, block: Block, applied_tx_ids: list, updated_accounts: dict) -> None`
-- **Description**: Low-level API for persisting an already-created block and its state changes in one SQLite transaction. Prefer `add_block` when appending to a live chain so persistence and in-memory state remain coordinated.
+- **Description**: Low-level primitive for persisting an already-created block and its state changes in one SQLite transaction. Callers must persist blocks in contiguous index order starting from genesis (`idx = 0`) and keep in-memory `Chain` state synchronized separately; duplicate `tx_id` collisions fail with `sqlite3.IntegrityError` and roll back the write. Prefer `add_block` when appending to a live chain.
 - **Example**:
   ```python
+  from blockchain_compression.compression import extract_block_delta
   from blockchain_compression.persistence import ChainStore
 
   with ChainStore("chain.db") as store:
       block = chain.add_block(transactions)
-      tx_ids = [tx["tx_id"] for tx in transactions]
-      updated = {tx["account"]: chain.state.get_current_state()[tx["account"]] for tx in transactions}
-      store.append_block(block, tx_ids, updated)
+      delta = extract_block_delta(transactions, chain.state)
+      store.append_block(block, delta.tx_ids, delta.updated_accounts)
   ```
 
-##### `add_block(self, chain: Chain, transactions: list) -> Block`
-- **Description**: Prepares a block and resulting state without mutating the chain, commits them to SQLite, then applies them to the in-memory chain. An empty store is initialized with the chain's genesis block; otherwise persisted headers must match the in-memory chain. A SQLite failure leaves both unchanged.
+##### `add_block(self, chain: Chain, transactions: list, zk_attachments: Iterable[ZKAttachment] | None = None) -> Block`
+- **Description**: Prepares a block and batch `BlockDelta` via `chain.prepare_block()` *before* opening the `BEGIN IMMEDIATE` SQLite write transaction, validates persisted `COUNT(*)` and tip `(idx, hash)` (seeding genesis on empty stores), inserts the block and delta atomically, and commits to `chain`. Once committed, binds `chain.state` to the store's bounded LRU replay cache when `max_cached_tx_ids` is enabled.
 - **Example**:
   ```python
   with ChainStore("chain.db") as store:
       block = store.add_block(chain, transactions)
   ```
 
-##### `prune_chain(self, pruner: BlockchainPruner) -> list[int]`
-- **Description**: Marks eligible block bodies pruned in SQLite in one transaction, then prunes the same blocks in memory. A SQLite failure leaves both the chain and persisted bodies unchanged.
+##### `prune_chain(self, pruner: BlockchainPruner, *, compact: bool = False) -> list[int]`
+- **Description**: Marks eligible block bodies (selected via `pruner.eligible_block_indices()`) pruned in SQLite and prunes the in-memory chain inside one `BEGIN IMMEDIATE` transaction, rolling back both storage and in-memory state/cursor on any failure. Set `compact=True` to invoke `compact()` afterward.
 
 ##### `mark_pruned(self, index: int) -> None`
-- **Description**: Mirrors an in-memory `Block.prune()` in storage: drops the persisted body and sets `is_pruned`.
+- **Description**: Low-level storage primitive mirroring `Block.prune()`: drops the persisted body and sets `is_pruned`. Does not mutate in-memory `Block` instances; prefer `prune_chain` for coordinated atomic pruning.
 - **Raises**: `KeyError` if no block with `index` is persisted.
 
-##### `load_chain(self) -> Chain`
-- **Description**: Reconstructs a full `Chain` from storage, headers and all, hydrating its `StateDelta` from `state_snapshot`/`applied_tx_ids` (never by replaying bodies, which may be pruned).
+##### `load_chain(self, validate: bool = True, check_bodies: bool = True, metrics: MetricsRegistry | None = None, compressor: BlockCompressor | None = None, max_cached_tx_ids: int | None = ...) -> Chain`
+- **Description**: Reconstructs a `Chain` inside a single `BEGIN DEFERRED` WAL read snapshot without acquiring write locks or building a throwaway genesis block. Hydrates `StateDelta` from `state_snapshot`, optional `zk_attachments`, and at most `max_cached_tx_ids` recent `applied_tx_ids` (defaulting to the store setting, backed by `has_applied_tx`; pass `max_cached_tx_ids=None` to hydrate all IDs for detached use). Raises `ValueError` if orphaned rows exist, attachment payloads are malformed, or validation fails.
 - **Example**:
   ```python
   with ChainStore("chain.db") as store:
@@ -343,8 +386,8 @@ blinding factor - which is what makes this actually zero-knowledge.
 ### **PedersenCommitment**
 
 ##### `commit(self, message: int, blinding: int | None = None) -> tuple[Commitment, int]`
-- **Description**: Commits to an integer `message` in `[0, Q)`. `blinding` defaults to a fresh cryptographically random value if not given.
-- **Raises**: `ValueError` if `message`/`blinding` are out of `[0, Q)` - rejected outright, never silently reduced.
+- **Description**: Commits to an integer `message` in `[0, Q)`. `blinding` defaults to a fresh cryptographically random value in `[1, Q)` if not given (`blinding=0` is rejected so commitments are always hiding).
+- **Raises**: `ValueError` if `message` is outside `[0, Q)`, `blinding` is outside `[1, Q)`, or either is a `bool`/non-`int`.
 - **Example**:
   ```python
   from blockchain_compression.zk_proof import PedersenCommitment
@@ -355,11 +398,13 @@ blinding factor - which is what makes this actually zero-knowledge.
 
 ##### `verify_opening(self, commitment: Commitment, message: int, blinding: int) -> bool`
 - **Description**: Checks that `(message, blinding)` is a valid opening of `commitment` - this reveals the message, unlike the Schnorr proof below.
+- **Raises**: `TypeError` if `commitment` is not a `Commitment` or if `commitment.value`, `message`, or `blinding` is not a strict `int` (`bool` is rejected). Returns `False` if any value is outside its valid range.
 
 ### Schnorr proof functions
 
 ##### `generate_proof(message: int, blinding: int, commitment: Commitment, metrics=None) -> SchnorrProof`
 - **Description**: Proves knowledge of `(message, blinding)` behind `commitment` without revealing them. Samples fresh nonces on every call - a Schnorr nonce must never be reused. Records a `proof_generation_seconds` histogram if `metrics` is given.
+- **Raises**: `TypeError` for non-`Commitment` or non-strict-`int` inputs (`bool` rejected); `ValueError` if `message` is outside `[0, Q)`, `blinding` is outside `[1, Q)`, or `commitment` is not a non-identity element of the order-`Q` subgroup.
 - **Example**:
   ```python
   from blockchain_compression.zk_proof import generate_proof, verify_proof
@@ -368,14 +413,16 @@ blinding factor - which is what makes this actually zero-knowledge.
   ```
 
 ##### `verify_proof(proof: SchnorrProof, commitment: Commitment, metrics=None) -> bool`
-- **Description**: Verifies `proof` against `commitment` alone. Independently recomputes the Fiat-Shamir challenge; never trusts a transmitted value for it.
+- **Description**: Verifies `proof` against `commitment` alone. Independently recomputes the Fiat-Shamir challenge; never trusts a transmitted value for it. Enforces range bounds (`1 < commitment.value < P`, `1 <= proof.t < P`, `0 <= proof.s1, proof.s2 < Q`) and order-`Q` subgroup membership (`pow(commitment.value, Q, P) == 1` and `pow(proof.t, Q, P) == 1`), which adds two 2048-bit modular exponentiations to verification.
+- **Raises**: `TypeError` if `proof`/`commitment` or their integer fields are not strict `int`s (`bool` rejected). Returns `False` for out-of-range or out-of-subgroup inputs.
 - **Example**:
   ```python
   assert verify_proof(proof, commitment)  # no message/blinding needed
   ```
 
 ##### `hash_to_scalar(data: dict) -> int`
-- **Description**: Maps arbitrary blockchain data (e.g. a transaction dict) to a Pedersen-committable scalar via canonical JSON + SHA-256, mod `Q`.
+- **Description**: Maps structured JSON-compatible blockchain data (e.g. a transaction dict) to a Pedersen-committable scalar by hashing `b"blockchain-compression-project/tx-scalar/v1" + canonical_json(data).encode("utf-8")` with SHA-256 mod `Q`. Changing the domain prefix alters all derived scalars.
+- **Raises**: `TypeError` if `data` is not a `dict` or contains non-JSON-native types (such as raw `bytes`); `ValueError` if `data` contains `NaN` or `Infinity`.
 - **Example**:
   ```python
   from blockchain_compression.zk_proof import hash_to_scalar
@@ -383,30 +430,44 @@ blinding factor - which is what makes this actually zero-knowledge.
   message = hash_to_scalar({"tx_id": "tx-1", "account": "Alice", "amount": 100})
   ```
 
+### Serialization & Optional Attachments
+
+##### `Commitment.to_dict()` / `Commitment.from_dict(data)` / `Commitment.to_bytes()` / `Commitment.from_bytes(data)`
+- **Description**: Canonical versioned (`version = 1`, `group = "rfc3526-modp-2048"`) serialization for `Commitment`. `to_dict()` encodes `value` as a fixed 512-char lowercase hex string; `to_bytes()` outputs 263 bytes (`b"BCPCOM\x01"` + 256-byte big-endian `value`). Deserializers enforce exact keys/headers/lengths, `(1, P)` bounds, and order-`Q` subgroup membership.
+
+##### `SchnorrProof.to_dict()` / `SchnorrProof.from_dict(data)` / `SchnorrProof.to_bytes()` / `SchnorrProof.from_bytes(data)`
+- **Description**: Canonical versioned (`version = 1`, `group = "rfc3526-modp-2048"`) serialization for `SchnorrProof`. `to_dict()` encodes `t`, `s1`, `s2` as fixed 512-char lowercase hex strings; `to_bytes()` outputs 775 bytes (`b"BCPZKP\x01"` + three 256-byte big-endian integers). Deserializers enforce exact keys/headers/lengths, scalar bounds, and order-`Q` subgroup membership for `t`.
+
+##### `ZKAttachment(commitment, proof=None, tx_id=None, version=1)`
+- **Description**: Optional versioned container associating a `Commitment` (and optional `SchnorrProof` / `tx_id`) with a block. Provides `to_dict()`, `from_dict()`, and opt-in `verify(metrics=None)` (returns `False` when `proof is None`). Does not introduce confidential-transaction semantics or automatic ledger enforcement.
+
+##### `blockchain_compression.zk_proof.groups.resolve_modexp_backend(backend: str | None = None) -> tuple[str, Callable]`
+- **Description**: Selects `"python"` (built-in `pow`, default zero-dependency backend) or optional `"gmpy2"` (controlled by `BLOCKCHAIN_COMPRESSION_ZK_BACKEND`, falling back to pure Python with a warning if `gmpy2` is unavailable). Neither backend changes cryptographic groups or proof formats.
+
 ---
 
 ## Observability Module
 
 ### **MetricsRegistry**
 
-An in-process metrics registry: counters, gauges, and histograms, exportable as JSON or
-Prometheus text exposition format. Passed explicitly (`metrics=...`) to `Chain`,
-`BlockchainPruner`, and the ZK proof functions - `None` (the default everywhere) is a true
-no-op, so nothing is recorded unless a registry is supplied.
+A thread-safe (protected by `threading.RLock`) in-process metrics registry: counters, gauges, and histograms, exportable as JSON or Prometheus text exposition format. Passed explicitly (`metrics=...`) to `Chain`, `BlockchainPruner`, and the ZK proof functions - `None` (the default everywhere) is a true no-op, so nothing is recorded unless a registry is supplied. Constants `DEFAULT_HISTOGRAM_BUCKETS` (seconds) and `COMPRESSION_RATIO_BUCKETS` (dimensionless ratios) are also provided.
 
 #### **Methods:**
 
 ##### `increment_counter(self, name, value=1.0, labels=None, help_text=None) -> None`
-- **Description**: Increments a monotonic counter. `value` must be non-negative.
+- **Description**: Increments a monotonic counter. `value` must be a finite, non-negative number (`bool`, `NaN`, and `Infinity` are rejected); label keys must match `^[a-zA-Z_][a-zA-Z0-9_]*$`.
 
 ##### `set_gauge(self, name, value, labels=None, help_text=None) -> None`
-- **Description**: Sets a point-in-time value.
+- **Description**: Sets a point-in-time finite numeric value; label keys must match `^[a-zA-Z_][a-zA-Z0-9_]*$`.
 
 ##### `observe_histogram(self, name, value, labels=None, help_text=None, buckets=None) -> None`
-- **Description**: Records one observation into cumulative buckets (`buckets` only takes effect on a metric's first observation).
+- **Description**: Records one finite observation into cumulative buckets (`buckets` only takes effect on a metric's first observation). Rejects the reserved label name `"le"` in `labels`.
+
+##### `get_counter(self, name, labels=None) -> float | None` / `get_gauge(self, name, labels=None) -> float | None` / `get_histogram(self, name, labels=None) -> HistogramSnapshot | None`
+- **Description**: Public read-only accessors returning the recorded series value (or an immutable `HistogramSnapshot` with `count`, `sum`, and read-only `MappingProxyType` `buckets`), or `None` if unrecorded without registering a metric.
 
 ##### `to_json(self, indent: int | None = 2) -> str`
-- **Description**: A structured snapshot of every metric family as one JSON document.
+- **Description**: A structured snapshot of every metric family as one strict RFC 8259 JSON document (`allow_nan=False`).
 
 ##### `to_prometheus_text(self) -> str`
 - **Description**: Hand-rolled Prometheus text exposition format (`# HELP`/`# TYPE` lines, cumulative `_bucket`/`_sum`/`_count` series for histograms) - no `prometheus_client` dependency.

@@ -89,6 +89,7 @@ verifiability back to genesis.
    uv run blockchain-compress-bench          # LZMA compression ratio and throughput
    uv run blockchain-compress-bench-merkle   # Merkle proof length/latency vs. tree depth
    uv run blockchain-compress-bench-pruning  # pruning latency/memory vs. chain length
+   uv run python -m blockchain_compression.benchmarks.scalability_benchmark  # full 4.x scalability suite
    ```
 
 ---
@@ -146,7 +147,7 @@ validate_chain() after pruning: True
 
 --- Reloading from disk ---
 Reloaded chain length: 9
-Reloaded state: {'Alice': 80.0, 'Bob': 95.0, 'Carol': 75.0}
+Reloaded state: {'Alice': 80, 'Bob': 95, 'Carol': 75}
 validate_chain() on the reloaded chain (pruned bodies and all): True
 
 --- Pedersen Commitment + Schnorr Zero-Knowledge Proof ---
@@ -164,6 +165,72 @@ Prometheus text exposition format:
 blocks_added_total 8.0
 ...
 ```
+
+---
+
+### Accounting Units, Limits & Schema Migration
+
+- **Accounting Units & Numeric Type**: Account balances and transaction `amount` values use
+  exact integer base units (`int`; `bool`, `float`, and `Decimal` values are rejected at the
+  API boundary) to eliminate floating-point rounding drift and precision loss above \(2^{53}\).
+- **Supported Range**: Amounts and cumulative balances must fit in a signed 64-bit integer
+  (`[-2**63, 2**63 - 1]`, i.e., `-9_223_372_036_854_775_808` through
+  `9_223_372_036_854_775_807`), matching SQLite's native `INTEGER` storage (`state_snapshot.balance`
+  enforces `INTEGER NOT NULL CHECK (typeof(balance) = 'integer')`).
+- **Schema Versioning & Migration (`PRAGMA user_version`)**:
+  - New databases are initialized at schema version `2` (`blocks`, `state_snapshot`,
+    `applied_tx_ids`, and optional `zk_attachments`).
+  - Legacy unversioned databases (`PRAGMA user_version = 0`) whose `state_snapshot.balance`
+    column used `REAL` are automatically migrated to v1 (`INTEGER` balances) inside a single
+    SQLite transaction and then upgraded to v2 when opened by `ChainStore`.
+  - Existing v1 databases (`PRAGMA user_version = 1`) are upgraded automatically to v2 by
+    adding the optional `zk_attachments` table without modifying existing blocks or balances.
+  - Migration from v0 converts finite, whole-number balances within `[-2**63, 2**63 - 1]` to
+    exact `INTEGER` values (logging a warning if any legacy `REAL` exceeded `2**53`, where
+    precision may already have been lost prior to upgrade).
+  - Databases containing fractional, non-finite, or out-of-range legacy balances fail
+    migration with a `ValueError` without altering the legacy table so operators can convert
+    balances to exact integer base units manually.
+  - Opening a database with a newer schema version (`PRAGMA user_version > 2`) raises a
+    `ValueError`.
+- **ZK Serialization & Optional Attachments**:
+  - `Commitment` and `SchnorrProof` provide canonical fixed-width 512-char lowercase hex
+    dictionary serialization (`to_dict()` / `from_dict()`, version `1`, group
+    `rfc3526-modp-2048`) and versioned fixed-width binary codecs (`to_bytes()` /
+    `from_bytes()`: 263 bytes with prefix `BCPCOM\x01` for commitments; 775 bytes with prefix
+    `BCPZKP\x01` for proofs).
+  - `ZKAttachment` is an optional, opt-in metadata container stored alongside blocks;
+    attachments do not alter block header hashes, are not confidential transactions, and are
+    not enforced by `Chain.validate_chain()` (call `Chain.verify_zk_attachments()` explicitly
+    for opt-in proof verification).
+- **Decompression Caps & Size-Aware Framing**:
+  - `BlockCompressor` defaults to `preset=1` (`DEFAULT_PRESET`) and `min_compress_bytes=256` (`DEFAULT_COMPRESSION_THRESHOLD`), prepending a 1-byte versioned frame header (`FRAME_RAW = 0x00` for raw UTF-8 JSON payloads below threshold or incompressible data; `FRAME_LZMA = 0x01` for LZMA streams). Trade-off: `preset=1` greatly lowers per-block compression latency vs `preset=6`/`9` with a modest ratio trade-off on very large redundant blocks; callers needing maximum density can configure `preset=6`/`9` or `min_compress_bytes=0`.
+  - Legacy unframed LZMA streams are auto-detected via `LZMA_MAGIC = 0xFD 0x37 0x7A 0x58 0x5A 0x00` for backward compatibility.
+  - `BlockCompressor.decompress_block()` enforces `DEFAULT_MAX_DECOMPRESSED_BYTES = 16 MiB` (configurable via `max_decompressed_bytes`) on both `FRAME_RAW` and LZMA payloads, verifying stream EOF and absence of trailing bytes to prevent decompression-bomb OOMs.
+- **SQLite WAL Concurrency, Durability, Tip Validation & Compaction**:
+  - `ChainStore` opens SQLite with `PRAGMA journal_mode = WAL`, `PRAGMA busy_timeout = 5000`, `PRAGMA synchronous = NORMAL` (configurable via `synchronous=`), and `PRAGMA auto_vacuum = INCREMENTAL`.
+  - **WAL sidecars & concurrency**: WAL creates `-wal` and `-shm` sidecar files alongside the database. Read paths (`load_chain`) pin point-in-time WAL snapshots with `BEGIN DEFERRED` (never blocking writers or upgrading to write locks), while write paths use `BEGIN IMMEDIATE` only *after* `Chain.prepare_block()` finishes CPU-intensive compression and hashing.
+  - **Durability trade-off**: `synchronous = NORMAL` skips per-commit `fsync` on WAL writes (fast appends, safe against OS/process crashes, though the most recent un-checkpointed WAL transaction can roll back on sudden power loss); pass `synchronous="FULL"` for strict per-commit power-loss durability.
+  - **Deferred compaction**: Logical pruning (`prune_chain` / `mark_pruned`) leaves freed pages on SQLite's freelist. Call `store.compact()` (or pass `compact=True` to `prune_chain`) to run `PRAGMA incremental_vacuum` and `PRAGMA wal_checkpoint(TRUNCATE)`. `auto_vacuum = INCREMENTAL` activates automatically only on newly created databases; pre-existing databases with `auto_vacuum = NONE` (or databases dominated by small `<1 KiB` inline rows on non-empty leaf pages) require a one-time `store.compact(full=True)` (`VACUUM`) to rewrite and compact leaf pages, whereas multi-KiB overflow-paged block bodies shrink immediately under `incremental_vacuum`.
+  - **Tip validation & incremental pruning**: `ChainStore._ensure_chain_persisted()` verifies persisted `COUNT(*)` and tip `(idx, hash)` on append (assuming mid-history SQLite rows are not altered externally between appends; full history and body verification remains available via `load_chain(validate=True)` / `chain.validate_chain()`). `BlockchainPruner` maintains `_next_unpruned_idx` so repeated prune passes avoid rescanning already-pruned prefixes.
+  - **Bounded replay cache**: `ChainStore` defaults `max_cached_tx_ids = 10_000`, configuring an LRU cache on `StateDelta` backed by SQLite's indexed `applied_tx_ids(tx_id)` table (`has_applied_tx`). Pruning preserves `applied_tx_ids` so replay protection stays intact across pruning and restarts. Once the RAM cache overflows, checking unseen `tx_id`s requires the backing `ChainStore` to remain open (failing closed with `RuntimeError` if closed); pass `max_cached_tx_ids=None` to `load_chain()` / `ChainStore()` for detached in-memory operation.
+- **Metrics Cardinality & Thread Safety**:
+  - `Chain.commit_block()` records constant-cardinality metrics (`blocks_added_total`, `block_raw_bytes_total`, `block_compressed_bytes_total`, `last_block_compression_ratio`, and the `block_compression_ratio` histogram) without unbounded per-block labels.
+  - `MetricsRegistry` synchronizes all metric updates, reads, and JSON/Prometheus snapshot assembly using `threading.RLock`, while serializing JSON and formatting Prometheus text outside the lock.
+- **Optional ZK Acceleration Evaluation**:
+  - Zero-dependency pure Python (`powmod = pow`) remains the default, preserving RFC 3526 2048-bit MODP parameters (`GROUP_ID = "rfc3526-modp-2048"`) and proof wire formats.
+  - Setting `BLOCKCHAIN_COMPRESSION_ZK_BACKEND=gmpy2` opts into `gmpy2.powmod` when `gmpy2` is installed (falling back with a warning to pure Python if absent), preserving full wire compatibility. Higher-speed elliptic-curve backends (`secp256k1` / `Ristretto255`) are documented for evaluation only and are not enabled automatically because switching groups breaks existing proofs and requires external crypto dependencies.
+- **Canonical JSON & Scalar Domain Separation**:
+  - `canonical_json()` enforces strict RFC 8259 JSON (`allow_nan=False`, no `default=str`),
+    raising `TypeError` on non-JSON-native types (such as raw `bytes`) and `ValueError` on
+    `NaN`/`Infinity`.
+  - `hash_to_scalar()` prepends the versioned domain tag
+    `b"blockchain-compression-project/tx-scalar/v1"` before hashing `canonical_json(data)`
+    (changing this domain tag is a breaking change for derived scalars).
+- **Cryptographic Validation**: `PedersenCommitment.commit()` requires `blinding` in `[1, Q)`
+  (forbidding `blinding=0`), and `verify_proof()` enforces strict integer types, scalar range
+  bounds (`0 <= s1, s2 < Q`), and order-`Q` subgroup membership (`pow(C, Q, P) == 1` and
+  `pow(t, Q, P) == 1`, adding two 2048-bit modular exponentiations to verification).
 
 ---
 

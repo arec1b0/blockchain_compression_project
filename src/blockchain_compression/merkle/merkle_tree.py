@@ -9,9 +9,20 @@ duplicate-last-hash scheme (CVE-2012-2459).
 """
 
 import hashlib
+import re
 
 LEAF_PREFIX = b"\x00"
 NODE_PREFIX = b"\x01"
+
+_HEX_DIGEST_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _validate_digest(value, *, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a 64-character hex string, got {type(value).__name__}")
+    if not _HEX_DIGEST_RE.fullmatch(value):
+        raise ValueError(f"{name} must be a 64-character hexadecimal digest")
+    return value
 
 
 class MerkleTree:
@@ -39,6 +50,8 @@ class MerkleTree:
     @staticmethod
     def hash_node(left: str, right: str) -> str:
         """Hash two child hex digests as an internal node (0x01-prefixed SHA-256)."""
+        _validate_digest(left, name="left")
+        _validate_digest(right, name="right")
         return hashlib.sha256(NODE_PREFIX + bytes.fromhex(left) + bytes.fromhex(right)).hexdigest()
 
     @classmethod
@@ -89,22 +102,39 @@ class MerkleTree:
         return proof
 
     @classmethod
-    def verify_proof(cls, transaction: str, proof: list, root: str) -> bool:
-        """Check that ``transaction`` is committed under ``root`` via ``proof``."""
+    def verify_proof(cls, transaction: str, proof: list, root: str | None) -> bool:
+        """Check that ``transaction`` is committed under ``root`` via ``proof``.
+
+        Validation contract:
+        - Raises ``TypeError`` if ``transaction`` is not a ``str``, ``proof`` is
+          not a ``list``, ``root`` is not ``str | None``, or any step ``'hash'``
+          is not a ``str``.
+        - Raises ``ValueError`` if ``root`` (when not ``None``) or any step
+          ``'hash'`` is not a 64-character hexadecimal digest, if a proof step
+          is not a dict with ``'hash'`` and ``'position'``, or if ``'position'``
+          is not ``'left'`` or ``'right'``.
+        - Returns ``False`` when ``root is None`` or when the derived root does
+          not match ``root``.
+        """
         if not isinstance(transaction, str):
             raise TypeError("transaction must be a string")
         if not isinstance(proof, list):
             raise TypeError("proof must be a list of proof steps")
-        if root is None:
-            return False
-        current = cls.hash_leaf(transaction)
+        if root is not None:
+            _validate_digest(root, name="root")
         for step in proof:
             if not isinstance(step, dict) or "hash" not in step or "position" not in step:
                 raise ValueError("each proof step must be a dict with 'hash' and 'position'")
+            _validate_digest(step["hash"], name="proof step 'hash'")
+            if step["position"] not in ("left", "right"):
+                raise ValueError("proof step position must be 'left' or 'right'")
+        if root is None:
+            return False
+
+        current = cls.hash_leaf(transaction)
+        for step in proof:
             if step["position"] == "right":
                 current = cls.hash_node(current, step["hash"])
-            elif step["position"] == "left":
-                current = cls.hash_node(step["hash"], current)
             else:
-                raise ValueError("proof step position must be 'left' or 'right'")
-        return current == root
+                current = cls.hash_node(step["hash"], current)
+        return current == root.lower()

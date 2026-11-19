@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class BlockchainPruner:
     """Keeps full bodies for the most recent ``max_full_blocks`` blocks of a
-    ``Chain``, pruning (header-only) every older block."""
+    ``Chain``, pruning (header-only) every older block incrementally."""
 
     def __init__(self, chain: Chain, max_full_blocks: int, metrics: MetricsRegistry | None = None):
         if not isinstance(chain, Chain):
@@ -33,21 +33,50 @@ class BlockchainPruner:
         self.chain = chain
         self.max_full_blocks = max_full_blocks
         self._metrics = metrics
+        self._next_unpruned_idx: int = 0
 
-    def prune(self) -> list:
-        """Prune every not-yet-pruned block older than the last
-        ``max_full_blocks``. Returns the list of newly-pruned block indices
-        (empty if none qualified)."""
+    @property
+    def next_unpruned_index(self) -> int:
+        """Lower bound on the next block index that has not yet been pruned."""
+        return self._next_unpruned_idx
+
+    def reset_cursor(self) -> None:
+        """Reset the incremental pruning scan cursor (e.g. after rollback)."""
+        self._next_unpruned_idx = 0
+
+    def _advance_pruned_prefix(self, limit: int) -> None:
+        while (
+            self._next_unpruned_idx < limit
+            and self.chain.get_block(self._next_unpruned_idx).is_pruned
+        ):
+            self._next_unpruned_idx += 1
+
+    def eligible_block_indices(self) -> list[int]:
+        """Return indices of unpruned blocks older than the last ``max_full_blocks``."""
         # Clamp at 0: a plain `len(chain) - max_full_blocks` goes negative when
         # the chain is shorter than the retention window, and slicing with a
         # negative index means something else entirely (`blocks[:-2]` keeps
         # all-but-the-last-2, not "keep everything").
         cutoff = max(0, len(self.chain) - self.max_full_blocks)
-        pruned_indices = []
-        for block in self.chain.blocks[:cutoff]:
-            if not block.is_pruned:
-                block.prune()
-                pruned_indices.append(block.index)
+        self._advance_pruned_prefix(cutoff)
+        if self._next_unpruned_idx >= cutoff:
+            return []
+        return [
+            idx
+            for idx in range(self._next_unpruned_idx, cutoff)
+            if not self.chain.get_block(idx).is_pruned
+        ]
+
+    def prune(self) -> list[int]:
+        """Prune every not-yet-pruned block older than the last
+        ``max_full_blocks``. Returns the list of newly-pruned block indices
+        (empty if none qualified)."""
+        cutoff = max(0, len(self.chain) - self.max_full_blocks)
+        pruned_indices = self.eligible_block_indices()
+        for index in pruned_indices:
+            self.chain.get_block(index).prune()
+        if cutoff > self._next_unpruned_idx:
+            self._next_unpruned_idx = cutoff
         if pruned_indices:
             logger.info(
                 "Pruned %d block body(ies); keeping the last %d full.",

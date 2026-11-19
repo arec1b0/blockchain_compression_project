@@ -9,6 +9,12 @@ import json
 
 
 def canonical_json(obj) -> str:
-    """Deterministic JSON encoding: sorted keys, no extra whitespace, non-JSON-native
-    values (e.g. bytes) coerced via ``str``."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    """Deterministic RFC 8259 JSON encoding: sorted keys, no extra whitespace.
+
+    Raises ``TypeError`` for non-JSON-native values (e.g. ``bytes``, ``set``,
+    or custom objects) rather than coercing them via ``str``, and ``ValueError``
+    for non-finite floats (``NaN``, ``Infinity``, ``-Infinity``). Callers must
+    explicitly encode binary values (such as hex or base64 strings) before
+    serialization.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), allow_nan=False)

@@ -9,12 +9,15 @@ import tempfile
 from pathlib import Path
 
 from blockchain_compression.chain import Chain
+from blockchain_compression.compression import extract_block_delta
 from blockchain_compression.merkle import MerkleTree
 from blockchain_compression.observability import get_metrics_registry
 from blockchain_compression.persistence import ChainStore
 from blockchain_compression.pruning import BlockchainPruner
 from blockchain_compression.zk_proof import (
+    Commitment,
     PedersenCommitment,
+    SchnorrProof,
     generate_proof,
     hash_to_scalar,
     verify_proof,
@@ -39,12 +42,10 @@ def _sync_block(store: ChainStore, chain: Chain, block, transactions: list) -> N
 
     ``ChainStore.append_block`` is deliberately decoupled from ``Chain`` - it
     has no way to derive these from a ``Chain.add_block()`` call on its own,
-    so the caller bridges the two explicitly, once, right here.
+    so the caller bridges the two explicitly using :func:`extract_block_delta`.
     """
-    tx_ids = [tx["tx_id"] for tx in transactions]
-    accounts = {tx["account"] for tx in transactions}
-    updated_balances = {account: chain.state.get_current_state()[account] for account in accounts}
-    store.append_block(block, tx_ids, updated_balances)
+    delta = extract_block_delta(transactions, chain.state)
+    store.append_block(block, delta.tx_ids, delta.updated_accounts)
 
 
 def main():
@@ -94,6 +95,7 @@ def main():
                 batch = [{"tx_id": f"tx-grow-{i:03d}", "account": "Bob", "amount": 5}]
                 store.add_block(chain, batch)
                 store.prune_chain(pruner)
+            store.compact()
             logger.info("Chain length after growth: %d", len(chain))
             logger.info("Blocks with a full body: %s", [b.index for b in chain if not b.is_pruned])
             logger.info("validate_chain() after pruning: %s", chain.validate_chain())
@@ -116,12 +118,14 @@ def main():
     zk_proof = generate_proof(
         message=message, blinding=blinding, commitment=commitment, metrics=metrics
     )
-    is_valid = verify_proof(zk_proof, commitment, metrics=metrics)
+    restored_commitment = Commitment.from_dict(commitment.to_dict())
+    restored_proof = SchnorrProof.from_dict(zk_proof.to_dict())
+    is_valid = verify_proof(restored_proof, restored_commitment, metrics=metrics)
     logger.info(
         "Committed to a transaction without revealing it: C=%d...", commitment.value % 10**12
     )
     logger.info(
-        "verify_proof(proof, commitment) - no transaction data passed in at all: %s", is_valid
+        "verify_proof(proof, commitment) after dict round-trip (no plaintext): %s", is_valid
     )
     logger.info(
         "(contrast with the old mock's verify_proof(proof, data), which needed the plaintext"

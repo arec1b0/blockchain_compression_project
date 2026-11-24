@@ -13,7 +13,14 @@ from pathlib import Path
 from blockchain_compression.chain import Block, Chain
 from blockchain_compression.compression import extract_block_delta
 from blockchain_compression.merkle import MerkleTree
-from blockchain_compression.observability import get_metrics_registry
+from blockchain_compression.observability import (
+    LOG_FORMATS,
+    LOG_LEVEL_ENV_VAR,
+    LOG_LEVELS,
+    configure_logging,
+    get_metrics_registry,
+    resolve_log_level,
+)
 from blockchain_compression.persistence import ChainStore
 from blockchain_compression.pruning import BlockchainPruner
 from blockchain_compression.zk_proof import (
@@ -69,18 +76,52 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional SQLite database file path (uses a temporary directory by default).",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=None,
+        help=(
+            f"Logging verbosity ({', '.join(LOG_LEVELS)}). "
+            f"Overrides {LOG_LEVEL_ENV_VAR} (default: INFO)."
+        ),
+    )
+    parser.add_argument(
+        "--log-format",
+        choices=LOG_FORMATS,
+        default="text",
+        help="Log output format: plain text (default) or single-line JSON.",
+    )
+    parser.add_argument(
+        "--verify-integrity",
+        action="store_true",
+        default=False,
+        help="Run ChainStore.verify_integrity() diagnostics when reopening the persisted DB.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Run the end-to-end CLI walkthrough with optional retention/storage flags."""
+    """Run the end-to-end CLI walkthrough with optional retention/storage/logging flags."""
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.max_full_blocks < 1:
         parser.error("--max-full-blocks must be at least 1")
+    try:
+        resolved_level = resolve_log_level(args.log_level)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_logging(resolved_level, log_format=args.log_format)
     metrics = get_metrics_registry()
+    logger.debug(
+        "CLI options: max_full_blocks=%d, db_path=%s, log_level=%s, "
+        "log_format=%s, verify_integrity=%s",
+        args.max_full_blocks,
+        args.db_path,
+        resolved_level,
+        args.log_format,
+        args.verify_integrity,
+    )
 
     logger.info("=== Blockchain Data Compression and Management ===")
 
@@ -141,6 +182,14 @@ def main(argv: list[str] | None = None) -> None:
 
         logger.info("\n--- Reloading from disk ---")
         with ChainStore(db_path) as store:
+            if args.verify_integrity:
+                report = store.verify_integrity(check_bodies=True, raise_on_error=True)
+                logger.info(
+                    "Integrity check passed: blocks=%d, schema_version=%d, indexes=%s",
+                    report.block_count,
+                    report.schema_version,
+                    list(report.indexes),
+                )
             reloaded = store.load_chain()
         logger.info("Reloaded chain length: %d", len(reloaded))
         logger.info("Reloaded state: %s", reloaded.state.get_current_state())

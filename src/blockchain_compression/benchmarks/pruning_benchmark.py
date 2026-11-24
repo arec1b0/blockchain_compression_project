@@ -15,16 +15,26 @@ Run with ``blockchain-compress-bench-pruning`` or
 ``python -m blockchain_compression.benchmarks.pruning_benchmark``.
 """
 
+import argparse
 import gc
 import logging
 import time
 import tracemalloc
 from dataclasses import dataclass
 
+from blockchain_compression.benchmarks._cli import (
+    add_common_benchmark_args,
+    emit_benchmark_output,
+    format_json_payload,
+)
 from blockchain_compression.chain import Chain
+from blockchain_compression.observability import configure_logging, resolve_log_level
 from blockchain_compression.pruning import BlockchainPruner
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_CHAIN_LENGTHS = (100, 1_000, 10_000)
+_DEFAULT_MAX_FULL_BLOCKS = 50
 
 
 @dataclass
@@ -75,27 +85,100 @@ def benchmark_pruning(chain_length: int, max_full_blocks: int = 50) -> PruningBe
     )
 
 
-def run_benchmarks(chain_lengths=(100, 1_000, 10_000), max_full_blocks: int = 50) -> list:
+def run_benchmarks(
+    chain_lengths: tuple[int, ...] = _DEFAULT_CHAIN_LENGTHS,
+    max_full_blocks: int = _DEFAULT_MAX_FULL_BLOCKS,
+) -> list[PruningBenchResult]:
     return [benchmark_pruning(length, max_full_blocks) for length in chain_lengths]
 
 
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="blockchain-compress-bench-pruning",
+        description="Benchmark incremental blockchain pruning latency and memory savings.",
+    )
+    parser.add_argument(
+        "--chain-lengths",
+        nargs="+",
+        type=int,
+        default=list(_DEFAULT_CHAIN_LENGTHS),
+        help="Chain block counts to construct and prune (default: 100 1000 10000).",
+    )
+    parser.add_argument(
+        "--max-full-blocks",
+        type=int,
+        default=_DEFAULT_MAX_FULL_BLOCKS,
+        help="Number of recent full block bodies retained during pruning (default: 50).",
+    )
+    add_common_benchmark_args(parser)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.max_full_blocks < 1:
+        parser.error("--max-full-blocks must be at least 1")
+    if any(length < 1 for length in args.chain_lengths):
+        parser.error("--chain-lengths values must be at least 1")
+    try:
+        resolved_level = resolve_log_level(args.log_level)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+    configure_logging(resolved_level)
+
+    using_defaults = (
+        args.chain_lengths == list(_DEFAULT_CHAIN_LENGTHS)
+        and args.max_full_blocks == _DEFAULT_MAX_FULL_BLOCKS
+    )
+    results = (
+        run_benchmarks()
+        if using_defaults
+        else run_benchmarks(
+            chain_lengths=tuple(args.chain_lengths),
+            max_full_blocks=args.max_full_blocks,
+        )
+    )
+
+    if args.json:
+        payload: dict[str, object] = {
+            "benchmark": "pruning",
+            "parameters": {
+                "chain_lengths": args.chain_lengths,
+                "max_full_blocks": args.max_full_blocks,
+            },
+            "results": [
+                {
+                    "chain_length": r.chain_length,
+                    "prune_seconds": r.prune_seconds,
+                    "memory_before_bytes": r.memory_before_bytes,
+                    "memory_after_bytes": r.memory_after_bytes,
+                    "memory_freed_bytes": r.memory_freed_bytes,
+                }
+                for r in results
+            ],
+        }
+        emit_benchmark_output(
+            format_json_payload(payload),
+            as_json=True,
+            output_path=args.output,
+            target_logger=logger,
+        )
+        return
+
     header = (
         f"{'chain length':>13} {'prune ms':>10} {'mem before KB':>14} "
         f"{'mem after KB':>13} {'freed KB':>10}"
     )
-    logger.info(header)
-    logger.info("-" * len(header))
-    for result in run_benchmarks():
-        logger.info(
-            "%13d %10.3f %14.1f %13.1f %10.1f",
-            result.chain_length,
-            result.prune_seconds * 1000,
-            result.memory_before_bytes / 1000,
-            result.memory_after_bytes / 1000,
-            result.memory_freed_bytes / 1000,
+    lines = [header, "-" * len(header)]
+    for result in results:
+        lines.append(
+            f"{result.chain_length:13d} {result.prune_seconds * 1000:10.3f} "
+            f"{result.memory_before_bytes / 1000:14.1f} "
+            f"{result.memory_after_bytes / 1000:13.1f} "
+            f"{result.memory_freed_bytes / 1000:10.1f}"
         )
+    emit_benchmark_output(lines, as_json=False, output_path=args.output, target_logger=logger)
 
 
 if __name__ == "__main__":

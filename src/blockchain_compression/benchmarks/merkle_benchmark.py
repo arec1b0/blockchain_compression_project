@@ -7,14 +7,24 @@ Run with ``blockchain-compress-bench-merkle`` or
 ``python -m blockchain_compression.benchmarks.merkle_benchmark``.
 """
 
+import argparse
 import logging
 import math
 from dataclasses import dataclass
 
+from blockchain_compression.benchmarks._cli import (
+    add_common_benchmark_args,
+    emit_benchmark_output,
+    format_json_payload,
+)
 from blockchain_compression.benchmarks.timing import best_time
 from blockchain_compression.merkle import MerkleTree
+from blockchain_compression.observability import configure_logging, resolve_log_level
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_SIZES = (10, 100, 1_000, 10_000, 100_000)
+_DEFAULT_REPEATS = 3
 
 
 @dataclass
@@ -53,27 +63,91 @@ def benchmark_size(num_transactions: int, repeats: int = 3) -> MerkleBenchResult
     )
 
 
-def run_benchmarks(sizes=(10, 100, 1_000, 10_000, 100_000), repeats: int = 3) -> list:
+def run_benchmarks(
+    sizes: tuple[int, ...] = _DEFAULT_SIZES, repeats: int = _DEFAULT_REPEATS
+) -> list[MerkleBenchResult]:
     return [benchmark_size(size, repeats) for size in sizes]
 
 
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="blockchain-compress-bench-merkle",
+        description="Benchmark Merkle proof generation and verification scaling.",
+    )
+    parser.add_argument(
+        "--sizes",
+        nargs="+",
+        type=int,
+        default=list(_DEFAULT_SIZES),
+        help="Transaction counts per tree (default: 10 100 1000 10000 100000).",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=_DEFAULT_REPEATS,
+        help="Timing repetitions per tree size (default: 3).",
+    )
+    add_common_benchmark_args(parser)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.repeats < 1:
+        parser.error("--repeats must be at least 1")
+    if any(size < 1 for size in args.sizes):
+        parser.error("--sizes values must be at least 1")
+    try:
+        resolved_level = resolve_log_level(args.log_level)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+    configure_logging(resolved_level)
+
+    using_defaults = args.sizes == list(_DEFAULT_SIZES) and args.repeats == _DEFAULT_REPEATS
+    results = (
+        run_benchmarks()
+        if using_defaults
+        else run_benchmarks(sizes=tuple(args.sizes), repeats=args.repeats)
+    )
+
+    if args.json:
+        payload: dict[str, object] = {
+            "benchmark": "merkle",
+            "parameters": {
+                "sizes": args.sizes,
+                "repeats": args.repeats,
+            },
+            "results": [
+                {
+                    "num_transactions": r.num_transactions,
+                    "proof_length": r.proof_length,
+                    "log2_bound": r.log2_bound,
+                    "get_proof_seconds": r.get_proof_seconds,
+                    "verify_seconds": r.verify_seconds,
+                }
+                for r in results
+            ],
+        }
+        emit_benchmark_output(
+            format_json_payload(payload),
+            as_json=True,
+            output_path=args.output,
+            target_logger=logger,
+        )
+        return
+
     header = (
         f"{'transactions':>13} {'proof len':>10} {'log2 bound':>11} "
         f"{'get_proof ms':>13} {'verify ms':>10}"
     )
-    logger.info(header)
-    logger.info("-" * len(header))
-    for result in run_benchmarks():
-        logger.info(
-            "%13d %10d %11d %13.4f %10.4f",
-            result.num_transactions,
-            result.proof_length,
-            result.log2_bound,
-            result.get_proof_seconds * 1000,
-            result.verify_seconds * 1000,
+    lines = [header, "-" * len(header)]
+    for result in results:
+        lines.append(
+            f"{result.num_transactions:13d} {result.proof_length:10d} {result.log2_bound:11d} "
+            f"{result.get_proof_seconds * 1000:13.4f} {result.verify_seconds * 1000:10.4f}"
         )
+    emit_benchmark_output(lines, as_json=False, output_path=args.output, target_logger=logger)
 
 
 if __name__ == "__main__":

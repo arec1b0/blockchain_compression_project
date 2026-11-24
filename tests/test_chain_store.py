@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import json
 import sqlite3
 import threading
 
@@ -11,7 +12,7 @@ from blockchain_compression.chain import Block, Chain
 from blockchain_compression.compression import BlockCompressor, StateDelta, extract_block_delta
 from blockchain_compression.compression.state_delta import MAX_BALANCE, MIN_BALANCE
 from blockchain_compression.observability import MetricsRegistry
-from blockchain_compression.persistence import ChainStore
+from blockchain_compression.persistence import ChainStore, IntegrityReport
 from blockchain_compression.persistence.chain_store import _convert_legacy_balance
 from blockchain_compression.pruning import BlockchainPruner
 from blockchain_compression.zk_proof import (
@@ -620,16 +621,19 @@ def test_v1_schema_migrates_to_v2_and_preserves_existing_blocks(tmp_path):
 def test_sqlite_wal_and_durability_pragmas_and_validation(tmp_path):
     db_path = tmp_path / "wal.db"
     with ChainStore(db_path) as store:
-        assert store._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        assert store._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
-        assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
-        assert store._conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
-        assert store._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert str(store.get_pragma("journal_mode")).lower() == "wal"
+        assert store.get_pragma("auto_vacuum") == 2
+        assert store.get_pragma("busy_timeout") == 5000
+        assert store.get_pragma("synchronous") == 1  # NORMAL
+        assert store.get_pragma("foreign_keys") == 1
+        pragmas = store.get_pragmas()
+        assert pragmas["user_version"] == 2
+        assert pragmas["foreign_keys"] == 1
 
     db_full = tmp_path / "wal_full.db"
     with ChainStore(db_full, busy_timeout_ms=1500, synchronous="FULL") as store:
-        assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1500
-        assert store._conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+        assert store.get_pragma("busy_timeout") == 1500
+        assert store.get_pragma("synchronous") == 2  # FULL
 
     with pytest.raises(ValueError, match="busy_timeout_ms"):
         ChainStore(tmp_path / "bad1.db", busy_timeout_ms=-1)
@@ -665,15 +669,15 @@ def test_prune_and_compact_reclaim_disk_space(tmp_path):
         pruner = BlockchainPruner(chain, max_full_blocks=2)
         pruned = store.prune_chain(pruner, compact=False)
         assert len(pruned) == 24
-        freelist_after_prune = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        freelist_after_prune = int(store.get_pragma("freelist_count"))
         assert freelist_after_prune > 5
 
         store.compact(pages=5)
-        freelist_after_partial = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        freelist_after_partial = int(store.get_pragma("freelist_count"))
         assert freelist_after_partial == freelist_after_prune - 5
 
         store.compact()
-        freelist_after_compact = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        freelist_after_compact = int(store.get_pragma("freelist_count"))
         size_after_compact = db_path.stat().st_size
 
         # Adding more blocks and pruning with compact=True compacts inline cleanly.
@@ -688,12 +692,12 @@ def test_prune_and_compact_reclaim_disk_space(tmp_path):
                 for j in range(90)
             ]
             store.add_block(chain, batch)
-        store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        store.compact()
         size_before_second_prune = db_path.stat().st_size
         pruned_more = store.prune_chain(pruner, compact=True)
         assert pruned_more == [24, 25, 26, 27, 28]
         size_after_second_compact = db_path.stat().st_size
-        assert store._conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+        assert store.get_pragma("freelist_count") == 0
         assert size_after_second_compact < size_before_second_prune
 
     assert freelist_after_compact == 0
@@ -770,9 +774,9 @@ def test_compact_parameter_validation_and_legacy_full_vacuum(tmp_path):
         pruner = BlockchainPruner(chain, max_full_blocks=2)
         store.prune_chain(pruner)
         # Before full VACUUM, incremental_vacuum cannot shrink a DB created with auto_vacuum=0.
-        assert store._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+        assert store.get_pragma("auto_vacuum") == 0
         store.compact(full=True)
-        assert store._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+        assert store.get_pragma("auto_vacuum") == 2
         after_full = db_path.stat().st_size
 
         with pytest.raises(ValueError, match="pages"):
@@ -1001,7 +1005,7 @@ def test_chain_store_schema_healing_and_incompatible_column_checks(tmp_path):
         )
         conn.commit()
     with ChainStore(partial_v1) as store:
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert store.get_pragma("user_version") == 2
         assert store.applied_tx_count() == 0
 
     # Partial v2 DB missing zk_attachments recreates it cleanly.
@@ -1027,13 +1031,11 @@ def test_chain_store_schema_healing_and_incompatible_column_checks(tmp_path):
         )
         conn.commit()
     with ChainStore(partial_v2) as store:
-        tables = {
-            row[0]
-            for row in store._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        assert "zk_attachments" in tables
+        assert store.verify_integrity().ok is True
+    tables = {
+        row[0] for row in _query_db(partial_v2, "SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "zk_attachments" in tables
 
     # Legacy v0 DB with blocks only (no state_snapshot) creates state_snapshot on migration.
     partial_v0 = tmp_path / "partial_v0.db"
@@ -1049,7 +1051,7 @@ def test_chain_store_schema_healing_and_incompatible_column_checks(tmp_path):
         )
         conn.commit()
     with ChainStore(partial_v0) as store:
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert store.get_pragma("user_version") == 2
 
 
 def test_chain_store_error_paths_and_input_validation(tmp_path, monkeypatch):
@@ -1097,12 +1099,16 @@ def test_chain_store_error_paths_and_input_validation(tmp_path, monkeypatch):
         assert store.prune_chain(pruner_noop) == []
 
         # compact() inside an open transaction raises RuntimeError cleanly.
-        store._conn.execute("BEGIN IMMEDIATE")
-        try:
-            with pytest.raises(RuntimeError, match="transaction is active"):
-                store.compact()
-        finally:
-            store._conn.execute("ROLLBACK")
+        pruner_in_tx = BlockchainPruner(chain, max_full_blocks=1)
+
+        def _compact_during_tx():
+            store.compact()
+            return []
+
+        monkeypatch.setattr(pruner_in_tx, "prune", _compact_during_tx)
+        with pytest.raises(RuntimeError, match="transaction is active"):
+            store.prune_chain(pruner_in_tx)
+        assert all(not b.is_pruned for b in chain)
 
         # Mid-prune chain mutation before or inside pruner.prune() rolls back safely.
         pruner_mut = BlockchainPruner(chain, max_full_blocks=2)
@@ -1130,7 +1136,7 @@ def test_chain_store_error_paths_and_input_validation(tmp_path, monkeypatch):
 
             # Missing persisted block row raises KeyError and rolls back cleanly.
             monkeypatch.undo()
-            store2._conn.execute("DELETE FROM blocks WHERE idx = 0")
+            _exec_db(db_mismatch, "DELETE FROM blocks WHERE idx = 0")
             with pytest.raises(KeyError, match="no persisted block with index 0"):
                 store2.prune_chain(p_mismatch)
             assert not chain_small.get_block(0).is_pruned
@@ -1164,3 +1170,244 @@ def test_load_chain_zero_cache_zk_mismatch_and_int64_boundaries(tmp_path):
     with ChainStore(db_path) as store:
         with pytest.raises(ValueError, match="does not match payload_json"):
             store.load_chain()
+
+
+def test_schema_indexes_created_and_zk_index_skipped_when_table_absent(tmp_path, monkeypatch):
+    fresh_db = tmp_path / "fresh_indexes.db"
+    with ChainStore(fresh_db) as store:
+        report = store.verify_integrity()
+        assert isinstance(report, IntegrityReport)
+        assert report.ok is True
+        assert report.quick_check_ok is True
+        assert report.quick_check_messages == ("ok",)
+        assert report.chain_valid is True
+        assert report.block_count == 0
+        assert report.schema_version == 2
+        assert "idx_applied_tx_ids_block_idx" in report.indexes
+        assert "idx_zk_attachments_block_idx" in report.indexes
+
+        serialized = report.to_dict()
+        assert json.loads(json.dumps(serialized))["indexes"] == list(report.indexes)
+
+    # Pre-existing v2 DB without indexes heals both indexes on open without altering user_version.
+    v2_no_idx = tmp_path / "v2_no_indexes.db"
+    with contextlib.closing(sqlite3.connect(str(v2_no_idx))) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE blocks (
+                idx INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, merkle_root TEXT,
+                hash TEXT NOT NULL UNIQUE, timestamp REAL NOT NULL, body BLOB,
+                is_pruned INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE state_snapshot (
+                account TEXT PRIMARY KEY,
+                balance INTEGER NOT NULL CHECK (typeof(balance) = 'integer')
+            );
+            CREATE TABLE applied_tx_ids (
+                tx_id TEXT PRIMARY KEY,
+                block_idx INTEGER NOT NULL REFERENCES blocks(idx)
+            );
+            CREATE TABLE zk_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_idx INTEGER NOT NULL REFERENCES blocks(idx),
+                tx_id TEXT,
+                payload_json TEXT NOT NULL
+            );
+            PRAGMA user_version = 2;
+            """
+        )
+        conn.commit()
+    with ChainStore(v2_no_idx) as store:
+        assert store.get_pragma("user_version") == 2
+        assert set(store.verify_integrity().indexes) >= {
+            "idx_applied_tx_ids_block_idx",
+            "idx_zk_attachments_block_idx",
+        }
+
+    # Pre-existing v1 DB missing idx_applied_tx_ids_block_idx gains both indexes on v1->v2.
+    v1_no_idx = tmp_path / "v1_no_indexes.db"
+    with contextlib.closing(sqlite3.connect(str(v1_no_idx))) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE blocks (
+                idx INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, merkle_root TEXT,
+                hash TEXT NOT NULL UNIQUE, timestamp REAL NOT NULL, body BLOB,
+                is_pruned INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE state_snapshot (
+                account TEXT PRIMARY KEY,
+                balance INTEGER NOT NULL CHECK (typeof(balance) = 'integer')
+            );
+            CREATE TABLE applied_tx_ids (
+                tx_id TEXT PRIMARY KEY,
+                block_idx INTEGER NOT NULL REFERENCES blocks(idx)
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+        conn.commit()
+    with ChainStore(v1_no_idx) as store:
+        assert store.get_pragma("user_version") == 2
+        assert set(store.verify_integrity().indexes) >= {
+            "idx_applied_tx_ids_block_idx",
+            "idx_zk_attachments_block_idx",
+        }
+
+    # Without zk_attachments in a v1 schema, _ensure_indexes skips idx_zk_attachments_block_idx.
+    v1_only = tmp_path / "partial_v1_no_zk.db"
+    with contextlib.closing(sqlite3.connect(str(v1_only))) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE blocks (
+                idx INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, merkle_root TEXT,
+                hash TEXT NOT NULL UNIQUE, timestamp REAL NOT NULL, body BLOB,
+                is_pruned INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE state_snapshot (
+                account TEXT PRIMARY KEY,
+                balance INTEGER NOT NULL CHECK (typeof(balance) = 'integer')
+            );
+            CREATE TABLE applied_tx_ids (
+                tx_id TEXT PRIMARY KEY,
+                block_idx INTEGER NOT NULL REFERENCES blocks(idx)
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+        conn.commit()
+    monkeypatch.setattr(ChainStore, "_migrate_v1_to_v2", lambda self: None)
+    with ChainStore(v1_only) as store:
+        assert store.get_pragma("user_version") == 1
+    idx_names = {
+        row[0] for row in _query_db(v1_only, "SELECT name FROM sqlite_master WHERE type = 'index'")
+    }
+    assert "idx_applied_tx_ids_block_idx" in idx_names
+    assert "idx_zk_attachments_block_idx" not in idx_names
+
+
+def test_verify_integrity_and_startup_check_behavior(tmp_path):
+    db_path = tmp_path / "integrity.db"
+    commitment, blinding = PedersenCommitment().commit(hash_to_scalar(_tx("tx-zk", "Alice", 5)))
+    valid_proof = generate_proof(
+        message=hash_to_scalar(_tx("tx-zk", "Alice", 5)),
+        blinding=blinding,
+        commitment=commitment,
+    )
+    att = ZKAttachment(commitment=commitment, proof=valid_proof, tx_id="tx-zk")
+
+    with ChainStore(db_path) as store:
+        chain = Chain()
+        store.add_block(chain, [_tx("tx-zk", "Alice", 5)], zk_attachments=[att])
+        store.add_block(chain, [_tx("tx-2", "Alice", 10)])
+        store.prune_chain(BlockchainPruner(chain, max_full_blocks=1))
+
+        report = store.verify_integrity(check_bodies=True, verify_zk=True)
+        assert report.ok is True
+        assert report.quick_check_ok is True
+        assert report.chain_valid is True
+        assert report.block_count == 3
+        assert report.errors == ()
+
+    # Default open does NOT run full body validation automatically, even if a body is tampered.
+    _exec_db(db_path, "UPDATE blocks SET body = X'0000' WHERE idx = 2")
+    with ChainStore(db_path) as store:
+        report_skip_bodies = store.verify_integrity(check_bodies=False)
+        assert report_skip_bodies.ok is True
+
+        report_with_bodies = store.verify_integrity(check_bodies=True)
+        assert report_with_bodies.ok is False
+        assert report_with_bodies.quick_check_ok is True
+        assert report_with_bodies.chain_valid is False
+        assert any("chain validation failed" in err for err in report_with_bodies.errors)
+
+        with pytest.raises(ValueError, match="integrity verification failed"):
+            store.verify_integrity(check_bodies=True, raise_on_error=True)
+
+    # Opt-in startup check rejects the tampered DB and closes cleanly.
+    with pytest.raises(ValueError, match="integrity verification failed"):
+        ChainStore(db_path, check_integrity_on_open=True)
+
+    # Invalid check_integrity_on_open type fails fast.
+    with pytest.raises(TypeError, match="check_integrity_on_open"):
+        ChainStore(tmp_path / "bad_flag.db", check_integrity_on_open="yes")
+
+    # ZK verification failure surfaces cleanly when verify_zk=True.
+    zk_bad_db = tmp_path / "bad_zk_integrity.db"
+    with ChainStore(zk_bad_db) as store:
+        c2 = Chain()
+        unproven = ZKAttachment(commitment=commitment, proof=None, tx_id="tx-zk2")
+        store.add_block(c2, [_tx("tx-zk2", "Alice", 5)], zk_attachments=[unproven])
+        assert store.verify_integrity(verify_zk=False).ok is True
+        bad_zk_report = store.verify_integrity(verify_zk=True)
+        assert bad_zk_report.ok is False
+        assert bad_zk_report.chain_valid is False
+        assert any("ZK attachments failed" in err for err in bad_zk_report.errors)
+
+
+def test_verify_integrity_detects_physical_sqlite_page_corruption(tmp_path):
+    db_path = tmp_path / "physical_corrupt.db"
+    with ChainStore(db_path) as store:
+        chain = Chain()
+        for i in range(15):
+            batch = [
+                {
+                    "tx_id": f"phys-{i}-{j}",
+                    "account": f"Acct{j % 4}",
+                    "amount": 1,
+                    "memo": hashlib.sha256(f"{i}-{j}".encode()).hexdigest(),
+                }
+                for j in range(30)
+            ]
+            store.add_block(chain, batch)
+        store.compact(full=True)
+
+    raw = bytearray(db_path.read_bytes())
+    page_size = int.from_bytes(raw[16:18], "big")
+    if page_size == 1:
+        page_size = 65536
+    assert len(raw) >= page_size * 4
+    # Corrupt payload bytes in a late data page (keeping page 1 schema/header readable).
+    corrupt_offset = len(raw) - (page_size // 2)
+    raw[corrupt_offset : corrupt_offset + 256] = b"\xff" * 256
+    db_path.write_bytes(bytes(raw))
+
+    with ChainStore(db_path) as store:
+        report = store.verify_integrity(check_bodies=True)
+        assert report.ok is False
+        assert report.errors
+        with pytest.raises(ValueError, match="integrity verification failed"):
+            store.verify_integrity(check_bodies=True, raise_on_error=True)
+
+    with pytest.raises(ValueError, match="integrity verification failed"):
+        ChainStore(db_path, check_integrity_on_open=True)
+
+
+def test_get_pragma_and_verify_integrity_input_validation(tmp_path):
+    db_path = tmp_path / "pragma_api.db"
+    store = ChainStore(db_path)
+    try:
+        pragmas = store.get_pragmas()
+        assert pragmas["journal_mode"].lower() == "wal"
+        assert pragmas["user_version"] == 2
+        assert pragmas["foreign_keys"] == 1
+        assert store.get_pragma(" PAGE_SIZE ") > 0
+
+        with pytest.raises(TypeError, match="pragma name"):
+            store.get_pragma(123)
+        with pytest.raises(ValueError, match="unsupported read-only pragma"):
+            store.get_pragma("writable_schema")
+        with pytest.raises(TypeError, match="check_bodies"):
+            store.verify_integrity(check_bodies="yes")
+        with pytest.raises(TypeError, match="verify_zk"):
+            store.verify_integrity(verify_zk="yes")
+        with pytest.raises(TypeError, match="raise_on_error"):
+            store.verify_integrity(raise_on_error="yes")
+    finally:
+        store.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        store.get_pragma("user_version")
+    with pytest.raises(RuntimeError, match="closed"):
+        store.get_pragmas()
+    with pytest.raises(RuntimeError, match="closed"):
+        store.verify_integrity()

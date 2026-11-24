@@ -34,15 +34,27 @@ Operational & durability defaults:
   databases; pre-existing databases with ``auto_vacuum = NONE`` require a
   one-time ``compact(full=True)`` (``VACUUM``) before incremental compaction can
   reclaim pages.
+- Schema indexes: creates ``idx_applied_tx_ids_block_idx`` on
+  ``applied_tx_ids(block_idx)`` (and ``idx_zk_attachments_block_idx`` on
+  ``zk_attachments(block_idx)`` when the v2 table exists) to avoid full table
+  scans on foreign-key checks and block-level lookups, at the cost of a small
+  additional B-tree update per inserted transaction ID or attachment.
+- Startup & diagnostics: by default ``ChainStore`` skips expensive full
+  ``PRAGMA quick_check`` + body validation on open (``check_integrity_on_open=False``).
+  Call :meth:`verify_integrity` explicitly after backup restores, crash
+  recovery, or before critical migrations/exports, or pass
+  ``check_integrity_on_open=True`` when strict open-time verification is needed.
 """
 
 import json
 import logging
 import math
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from blockchain_compression.canonical import canonical_json
 from blockchain_compression.chain.block import Block
@@ -99,6 +111,54 @@ CREATE TABLE IF NOT EXISTS zk_attachments (
 )
 """
 
+_CREATE_APPLIED_TX_IDS_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_applied_tx_ids_block_idx ON applied_tx_ids(block_idx)"
+)
+_CREATE_ZK_ATTACHMENTS_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_zk_attachments_block_idx ON zk_attachments(block_idx)"
+)
+
+_READABLE_PRAGMAS: dict[str, str] = {
+    "auto_vacuum": "PRAGMA auto_vacuum",
+    "busy_timeout": "PRAGMA busy_timeout",
+    "foreign_keys": "PRAGMA foreign_keys",
+    "freelist_count": "PRAGMA freelist_count",
+    "journal_mode": "PRAGMA journal_mode",
+    "page_count": "PRAGMA page_count",
+    "page_size": "PRAGMA page_size",
+    "synchronous": "PRAGMA synchronous",
+    "user_version": "PRAGMA user_version",
+}
+
+
+@dataclass(frozen=True)
+class IntegrityReport:
+    """Structured diagnostic summary returned by :meth:`ChainStore.verify_integrity`."""
+
+    ok: bool
+    quick_check_ok: bool
+    quick_check_messages: tuple[str, ...]
+    chain_valid: bool
+    block_count: int
+    schema_version: int
+    indexes: tuple[str, ...]
+    pragmas: Mapping[str, int | str]
+    errors: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        """Convert this diagnostic report into a JSON-serializable dictionary."""
+        return {
+            "ok": self.ok,
+            "quick_check_ok": self.quick_check_ok,
+            "quick_check_messages": list(self.quick_check_messages),
+            "chain_valid": self.chain_valid,
+            "block_count": self.block_count,
+            "schema_version": self.schema_version,
+            "indexes": list(self.indexes),
+            "pragmas": dict(self.pragmas),
+            "errors": list(self.errors),
+        }
+
 
 def _convert_legacy_balance(account: object, balance: object) -> int:
     """Convert a legacy v0 ``REAL`` balance value into an exact 64-bit integer."""
@@ -139,6 +199,7 @@ class ChainStore:
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         synchronous: str = DEFAULT_SYNCHRONOUS,
         max_cached_tx_ids: int | None = DEFAULT_MAX_CACHED_TX_IDS,
+        check_integrity_on_open: bool = False,
     ):
         if (
             isinstance(busy_timeout_ms, bool)
@@ -158,6 +219,11 @@ class ChainStore:
             or max_cached_tx_ids < 0
         ):
             raise ValueError("max_cached_tx_ids must be a non-negative integer or None")
+        if not isinstance(check_integrity_on_open, bool):
+            raise TypeError(
+                "check_integrity_on_open must be a bool, "
+                f"got {type(check_integrity_on_open).__name__}"
+            )
 
         self._max_cached_tx_ids: int | None = max_cached_tx_ids
         self._closed = False
@@ -176,6 +242,8 @@ class ChainStore:
             self._conn.execute("PRAGMA journal_mode = WAL").fetchall()
             self._conn.execute(f"PRAGMA synchronous = {sync_mode}")
             self._ensure_schema()
+            if check_integrity_on_open:
+                self.verify_integrity(check_bodies=True, raise_on_error=True)
         except BaseException:
             self._closed = True
             self._conn.close()
@@ -206,10 +274,45 @@ class ChainStore:
         self._conn.execute(_CREATE_BLOCKS_SQL)
         self._conn.execute(_CREATE_STATE_SNAPSHOT_SQL)
         self._conn.execute(_CREATE_APPLIED_TX_IDS_SQL)
+        self._conn.execute(_CREATE_APPLIED_TX_IDS_INDEX_SQL)
 
     def _create_v2_tables(self) -> None:
         self._create_v1_tables()
         self._conn.execute(_CREATE_ZK_ATTACHMENTS_SQL)
+        self._conn.execute(_CREATE_ZK_ATTACHMENTS_INDEX_SQL)
+
+    def _ensure_indexes(self, existing_tables: set[str] | None = None) -> None:
+        """Ensure block_idx lookup indexes exist for every present target table."""
+        tables = existing_tables
+        if tables is None:
+            tables = {
+                row["name"]
+                for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('applied_tx_ids', 'zk_attachments')"
+                ).fetchall()
+            }
+        required: list[tuple[str, str]] = []
+        if "applied_tx_ids" in tables:
+            required.append(("idx_applied_tx_ids_block_idx", _CREATE_APPLIED_TX_IDS_INDEX_SQL))
+        # zk_attachments was added in schema version 2; skip creating its index on
+        # partial or pre-v2 schemas where the table does not exist yet.
+        if "zk_attachments" in tables:
+            required.append(("idx_zk_attachments_block_idx", _CREATE_ZK_ATTACHMENTS_INDEX_SQL))
+        if not required:
+            return
+        existing_indexes = {
+            row["name"]
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name IN ('idx_applied_tx_ids_block_idx', 'idx_zk_attachments_block_idx')"
+            ).fetchall()
+        }
+        missing_sql = [sql for idx_name, sql in required if idx_name not in existing_indexes]
+        if missing_sql:
+            with self._write_tx():
+                for sql in missing_sql:
+                    self._conn.execute(sql)
 
     def _validate_integer_snapshot_column(self) -> None:
         cols = {
@@ -240,6 +343,7 @@ class ChainStore:
 
         if user_version == SCHEMA_VERSION and len(existing_tables) == 4:
             self._validate_integer_snapshot_column()
+            self._ensure_indexes(existing_tables)
             return
 
         if user_version == 0:
@@ -257,6 +361,7 @@ class ChainStore:
                     if not tables_now:
                         self._create_v2_tables()
                         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self._ensure_indexes()
             else:
                 self._migrate_v0_to_v1(existing_tables)
                 self._migrate_v1_to_v2()
@@ -268,17 +373,20 @@ class ChainStore:
                     self._create_v1_tables()
             self._validate_integer_snapshot_column()
             self._migrate_v1_to_v2()
+            self._ensure_indexes()
             return
 
         # user_version == SCHEMA_VERSION (2) with missing table(s)
         with self._write_tx():
             self._create_v2_tables()
         self._validate_integer_snapshot_column()
+        self._ensure_indexes()
 
     def _migrate_v1_to_v2(self) -> None:
         """Upgrade a v1 database to v2 by adding the optional ``zk_attachments`` table."""
         with self._write_tx():
             self._conn.execute(_CREATE_ZK_ATTACHMENTS_SQL)
+            self._conn.execute(_CREATE_ZK_ATTACHMENTS_INDEX_SQL)
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _migrate_v0_to_v1(self, existing_tables: set[str]) -> None:
@@ -301,6 +409,7 @@ class ChainStore:
 
             self._conn.execute(_CREATE_BLOCKS_SQL)
             self._conn.execute(_CREATE_APPLIED_TX_IDS_SQL)
+            self._conn.execute(_CREATE_APPLIED_TX_IDS_INDEX_SQL)
             if "state_snapshot" not in existing_tables:
                 self._conn.execute(_CREATE_STATE_SNAPSHOT_SQL)
             elif migrated_rows is not None:
@@ -347,6 +456,118 @@ class ChainStore:
     def applied_tx_count(self) -> int:
         """Return total number of applied transaction IDs recorded in SQLite."""
         return int(self._conn.execute("SELECT COUNT(*) FROM applied_tx_ids").fetchone()[0])
+
+    def get_pragma(self, name: str) -> int | str:
+        """Read an allowlisted read-only SQLite PRAGMA without exposing the raw connection."""
+        if self._closed:
+            raise RuntimeError("ChainStore is closed")
+        if not isinstance(name, str):
+            raise TypeError(f"pragma name must be a str, got {type(name).__name__}")
+        key = name.strip().lower()
+        sql = _READABLE_PRAGMAS.get(key)
+        if sql is None:
+            allowed = sorted(_READABLE_PRAGMAS)
+            raise ValueError(f"unsupported read-only pragma {name!r}; allowed: {allowed}")
+        row = self._conn.execute(sql).fetchone()
+        if row is None:
+            raise RuntimeError(f"PRAGMA {key} returned no result")
+        value = row[0]
+        if not isinstance(value, (int, str)):
+            return str(value)
+        return value
+
+    def get_pragmas(self) -> dict[str, int | str]:
+        """Return a snapshot dictionary of all allowlisted SQLite PRAGMA settings."""
+        if self._closed:
+            raise RuntimeError("ChainStore is closed")
+        return {name: self.get_pragma(name) for name in sorted(_READABLE_PRAGMAS)}
+
+    def verify_integrity(
+        self,
+        *,
+        check_bodies: bool = True,
+        verify_zk: bool = False,
+        raise_on_error: bool = False,
+    ) -> IntegrityReport:
+        """Run SQLite ``PRAGMA quick_check`` and full chain validation.
+
+        Recommended after backup restores, crash recovery, or before critical
+        migrations/exports. Expensive body and page checks are skipped during
+        normal startup unless ``check_integrity_on_open=True`` is passed to
+        :class:`ChainStore`.
+        """
+        if self._closed:
+            raise RuntimeError("ChainStore is closed")
+        if not isinstance(check_bodies, bool):
+            raise TypeError(f"check_bodies must be a bool, got {type(check_bodies).__name__}")
+        if not isinstance(verify_zk, bool):
+            raise TypeError(f"verify_zk must be a bool, got {type(verify_zk).__name__}")
+        if not isinstance(raise_on_error, bool):
+            raise TypeError(f"raise_on_error must be a bool, got {type(raise_on_error).__name__}")
+
+        errors: list[str] = []
+        quick_check_ok = False
+        quick_check_messages: tuple[str, ...] = ()
+        try:
+            qc_rows = self._conn.execute("PRAGMA quick_check").fetchall()
+        except sqlite3.DatabaseError as exc:
+            msg = str(exc)
+            quick_check_messages = (msg,)
+            errors.append(f"SQLite quick_check failed: {exc}")
+        else:
+            quick_check_messages = tuple(str(row[0]) for row in qc_rows)
+            quick_check_ok = quick_check_messages == ("ok",)
+            if not quick_check_ok:
+                errors.append(
+                    f"SQLite quick_check reported issues: {'; '.join(quick_check_messages)}"
+                )
+
+        pragmas: dict[str, int | str] = {}
+        schema_version = -1
+        indexes: tuple[str, ...] = ()
+        block_count = 0
+        try:
+            pragmas = self.get_pragmas()
+            schema_version = int(pragmas["user_version"])
+            indexes = tuple(
+                row["name"]
+                for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND name NOT LIKE 'sqlite_autoindex_%' ORDER BY name"
+                ).fetchall()
+            )
+            block_count = int(self._conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0])
+        except sqlite3.DatabaseError as exc:
+            errors.append(f"SQLite metadata query failed: {exc}")
+
+        chain_valid = False
+        try:
+            chain = self.load_chain(validate=True, check_bodies=check_bodies)
+            chain_valid = True
+            if verify_zk and not chain.verify_zk_attachments():
+                chain_valid = False
+                errors.append("one or more persisted ZK attachments failed verification")
+        except (ValueError, TypeError, sqlite3.DatabaseError) as exc:
+            chain_valid = False
+            errors.append(f"chain validation failed: {exc}")
+
+        ok = quick_check_ok and chain_valid and not errors
+        report = IntegrityReport(
+            ok=ok,
+            quick_check_ok=quick_check_ok,
+            quick_check_messages=quick_check_messages,
+            chain_valid=chain_valid,
+            block_count=block_count,
+            schema_version=schema_version,
+            indexes=indexes,
+            pragmas=MappingProxyType(pragmas),
+            errors=tuple(errors),
+        )
+        if raise_on_error and not report.ok:
+            raise ValueError(
+                f"ChainStore integrity verification failed: {'; '.join(report.errors)}"
+            )
+        return report
 
     def compact(self, *, pages: int | None = None, full: bool = False) -> None:
         """Reclaim freelist pages left by pruning and checkpoint the WAL.

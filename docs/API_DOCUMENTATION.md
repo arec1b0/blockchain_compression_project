@@ -21,6 +21,7 @@ This document provides detailed information on the various modules, classes, and
     - [BlockchainPruner](#blockchainpruner)
 7. [Persistence Module](#persistence-module)
     - [ChainStore](#chainstore)
+    - [IntegrityReport](#integrityreport)
 8. [ZK Proof Module](#zk-proof-module)
     - [Commitment](#commitment)
     - [PedersenCommitment](#pedersencommitment)
@@ -28,8 +29,10 @@ This document provides detailed information on the various modules, classes, and
     - [Schnorr proof functions](#schnorr-proof-functions)
 9. [Observability Module](#observability-module)
     - [MetricsRegistry](#metricsregistry)
-10. [CLI Entry Point](#cli-entry-point)
+    - [CLI Logging Helpers](#cli-logging-helpers)
+10. [CLI Entry Points](#cli-entry-points)
     - [main](#mainargv-liststr--none---none)
+    - [Benchmark CLIs](#benchmark-clis)
 
 ---
 
@@ -349,12 +352,28 @@ full bodies for only the most recent blocks; older blocks keep their header (so
 
 SQLite-backed persistence for a `Chain`. Four tables back a round-trippable chain at schema version `2`:
 `blocks` (headers + optional body), `state_snapshot` (current account balances),
-`applied_tx_ids` (replay-protection membership), and optional `zk_attachments`. `state_snapshot` and `applied_tx_ids` aren't a cache: once a block is pruned, they're the *only* surviving record of what its transactions did.
+`applied_tx_ids` (replay-protection membership), and optional `zk_attachments`. Two non-unique lookup indexes are also managed automatically:
+- `idx_applied_tx_ids_block_idx` on `applied_tx_ids(block_idx)` (avoids full table scans on foreign-key checks and block lookups, adding a minor B-tree insert overhead per transaction ID).
+- `idx_zk_attachments_block_idx` on `zk_attachments(block_idx)` (created whenever `zk_attachments` exists; skipped on partial/pre-v2 schemas lacking that table).
+
+`state_snapshot` and `applied_tx_ids` aren't a cache: once a block is pruned, they're the *only* surviving record of what its transactions did.
 
 #### **Methods:**
 
-##### `__init__(self, path: str | Path, *, busy_timeout_ms: int = 5000, synchronous: str = "NORMAL", max_cached_tx_ids: int | None = 10_000)`
-- **Description**: Opens (creating if needed) a SQLite database at `path` configured with `PRAGMA auto_vacuum = INCREMENTAL`, `PRAGMA journal_mode = WAL`, `PRAGMA busy_timeout = busy_timeout_ms`, `PRAGMA synchronous = synchronous`, and `PRAGMA foreign_keys = ON`. Ensures schema version `2` exists (`state_snapshot.balance` as exact `INTEGER`, plus optional `zk_attachments`), automatically migrating v0 and v1 databases. `max_cached_tx_ids` bounds the in-memory replay LRU cache when persisting or reloading chains. Also usable as a context manager (`with ChainStore(path) as store:`).
+##### `__init__(self, path: str | Path, *, busy_timeout_ms: int = 5000, synchronous: str = "NORMAL", max_cached_tx_ids: int | None = 10_000, check_integrity_on_open: bool = False)`
+- **Description**: Opens (creating if needed) a SQLite database at `path` configured with `PRAGMA auto_vacuum = INCREMENTAL`, `PRAGMA journal_mode = WAL`, `PRAGMA busy_timeout = busy_timeout_ms`, `PRAGMA synchronous = synchronous`, and `PRAGMA foreign_keys = ON`. Ensures schema version `2` and indexes exist (`state_snapshot.balance` as exact `INTEGER`, plus optional `zk_attachments`), automatically migrating v0 and v1 databases. `max_cached_tx_ids` bounds the in-memory replay LRU cache when persisting or reloading chains. Startup integrity validation stays off by default (`check_integrity_on_open=False`); pass `True` to run `verify_integrity(check_bodies=True, raise_on_error=True)` immediately on open. Also usable as a context manager (`with ChainStore(path) as store:`).
+
+##### `get_pragma(self, name: str) -> int | str` / `get_pragmas(self) -> dict[str, int | str]`
+- **Description**: Public read-only accessors over allowlisted SQLite PRAGMAs (`auto_vacuum`, `busy_timeout`, `foreign_keys`, `freelist_count`, `journal_mode`, `page_count`, `page_size`, `synchronous`, `user_version`) without exposing internal connection state.
+- **Raises**: `TypeError` for non-string names, `ValueError` for non-allowlisted PRAGMA names, `RuntimeError` if called after `close()`.
+
+##### `verify_integrity(self, *, check_bodies: bool = True, verify_zk: bool = False, raise_on_error: bool = False) -> IntegrityReport`
+- **Description**: Runs SQLite `PRAGMA quick_check`, collects schema/index/PRAGMA metadata, and runs `load_chain(validate=True, check_bodies=check_bodies)` (plus optional `chain.verify_zk_attachments()` when `verify_zk=True`). Recommended after backup restores, crash recovery, or before critical migrations/exports.
+- **Raises**: `TypeError` if boolean flags are invalid, `RuntimeError` if closed, `ValueError` when `raise_on_error=True` and any check fails.
+
+### **IntegrityReport**
+
+Frozen dataclass returned by `ChainStore.verify_integrity()` with fields `ok`, `quick_check_ok`, `quick_check_messages`, `chain_valid`, `block_count`, `schema_version`, `indexes`, read-only `pragmas`, and `errors`, plus `to_dict() -> dict[str, object]` for JSON serialization.
 
 ##### `compact(self, *, pages: int | None = None, full: bool = False) -> None`
 - **Description**: Reclaims freelist pages left by logical pruning (`PRAGMA incremental_vacuum` + `PRAGMA wal_checkpoint(TRUNCATE)`). Pass `full=True` to run `PRAGMA auto_vacuum = INCREMENTAL` + a blocking `VACUUM` (required once on pre-existing databases without incremental auto-vacuum, or to coalesce sparse `<1 KiB` inline leaf pages).
@@ -528,10 +547,32 @@ A thread-safe (protected by `threading.RLock`) in-process metrics registry: coun
   print(metrics.to_prometheus_text())
   ```
 
+### **CLI Logging Helpers**
+
+- `LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")`
+- `LOG_FORMATS = ("text", "json")`
+- `LOG_LEVEL_ENV_VAR = "BLOCKCHAIN_COMPRESSION_LOG_LEVEL"`
+- `resolve_log_level(cli_level=None, *, env_var=LOG_LEVEL_ENV_VAR, default="INFO") -> str`: Resolves log verbosity giving `--log-level` precedence over `BLOCKCHAIN_COMPRESSION_LOG_LEVEL` (raises `TypeError`/`ValueError` on invalid input).
+- `configure_logging(level_name, *, log_format="text") -> int`: Configures root log level and optional single-line JSON formatter (`{"level", "logger", "message"}`).
+
 ---
 
-## CLI Entry Point
+## CLI Entry Points
 
-### **`main(argv: list[str] | None = None) -> None`**
-- **Description**: Runs the end-to-end demo workflow (chain creation, Merkle inclusion proof, SQLite WAL persistence + pruning + compaction, reload validation, Pedersen + Schnorr ZK round-trip, and JSON/Prometheus metrics export). Accepts `--max-full-blocks <N>` (`>= 1`, default `2`) and optional `--db-path <path>`.
-- **Raises**: `SystemExit` on invalid CLI arguments or `--help`.
+### **`main(argv: list[str] | None = None) -> None`** (`blockchain-compress`)
+- **Description**: Runs the end-to-end demo workflow (chain creation, Merkle inclusion proof, SQLite WAL persistence + pruning + compaction, optional integrity verification, reload validation, Pedersen + Schnorr ZK round-trip, and JSON/Prometheus metrics export).
+- **Flags**:
+  - `--max-full-blocks <N>` (`>= 1`, default `2`)
+  - `--db-path <path>` (optional; temporary directory if omitted)
+  - `--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}` (overrides `BLOCKCHAIN_COMPRESSION_LOG_LEVEL`, default `INFO`)
+  - `--log-format {text,json}` (default `text`)
+  - `--verify-integrity` (runs `ChainStore.verify_integrity()` on reload)
+- **Raises**: `SystemExit` on invalid CLI/env arguments or `--help`.
+
+### **Benchmark CLIs**
+
+All benchmark entry points preserve tabular output by default and support `--json` (deterministic RFC 8259 JSON on stdout), `--output <path>` (writes stdout/table to file), and `--log-level`:
+- `blockchain-compress-bench` (`benchmarks/compression_benchmark.py`): `--datasets`, `--presets`, `--repeats`, `--num-blocks`, `--txs-per-block`, `--data-size`, `--json`, `--output`, `--log-level`.
+- `blockchain-compress-bench-merkle` (`benchmarks/merkle_benchmark.py`): `--sizes`, `--repeats`, `--json`, `--output`, `--log-level`.
+- `blockchain-compress-bench-pruning` (`benchmarks/pruning_benchmark.py`): `--chain-lengths`, `--max-full-blocks`, `--json`, `--output`, `--log-level`.
+- `python -m blockchain_compression.benchmarks.scalability_benchmark`: `--repeats`, `--compression-tx-counts`, `--compression-repeats`, `--chain-heights`, `--sample-blocks`, `--prune-heights`, `--noop-height`, `--noop-calls`, `--sqlite-blocks`, `--overflow-blocks`, `--overflow-txs-per-block`, `--cache-probe-txs`, `--cache-limit`, `--zk-repeats`, `--json`, `--output`, `--log-level`.

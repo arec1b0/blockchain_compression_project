@@ -1,10 +1,18 @@
 # test_main.py
 
+import json
+import logging
+
 import pytest
 
 from blockchain_compression import main as main_mod
 from blockchain_compression.chain import Chain
-from blockchain_compression.observability import MetricsRegistry
+from blockchain_compression.observability import (
+    LOG_LEVEL_ENV_VAR,
+    MetricsRegistry,
+    configure_logging,
+    resolve_log_level,
+)
 from blockchain_compression.persistence import ChainStore
 
 
@@ -80,3 +88,85 @@ def test_sync_block_missing_account_raises(tmp_path):
                 blk,
                 [{"tx_id": "tx-x", "account": "Bob", "amount": 1}],
             )
+
+
+def test_main_log_level_env_var_and_json_logging(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(main_mod, "get_metrics_registry", MetricsRegistry)
+
+    # WARNING suppresses INFO banner lines while completing cleanly.
+    caplog.clear()
+    main_mod.main(["--log-level", "warning"])
+    assert "Chain length (incl. genesis):" not in caplog.text
+
+    # Environment variable sets default level; CLI flag takes precedence over env var.
+    monkeypatch.setenv(LOG_LEVEL_ENV_VAR, "WARNING")
+    assert resolve_log_level() == "WARNING"
+    assert resolve_log_level("debug") == "DEBUG"
+
+    caplog.clear()
+    main_mod.main([])
+    assert "Chain length (incl. genesis):" not in caplog.text
+
+    caplog.clear()
+    main_mod.main(["--log-level", "DEBUG", "--log-format", "json"])
+    records = [json.loads(line) for line in caplog.text.strip().splitlines()]
+    assert any(r["level"] == "DEBUG" and "CLI options:" in r["message"] for r in records)
+    assert any(
+        r["level"] == "INFO" and r["logger"] == "blockchain_compression.main" for r in records
+    )
+
+    # Restore plain text formatter on active handlers when run with default text format.
+    caplog.clear()
+    main_mod.main(["--log-level", "INFO"])
+    assert "Chain length (incl. genesis): 4" in caplog.text
+
+    # Invalid CLI or env log level fails with actionable error.
+    with pytest.raises(SystemExit) as bad_cli_lvl:
+        main_mod.main(["--log-level", "TRACE"])
+    assert bad_cli_lvl.value.code == 2
+
+    monkeypatch.setenv(LOG_LEVEL_ENV_VAR, "BOGUS")
+    with pytest.raises(SystemExit) as bad_env_lvl:
+        main_mod.main([])
+    assert bad_env_lvl.value.code == 2
+    monkeypatch.delenv(LOG_LEVEL_ENV_VAR)
+
+    with pytest.raises(SystemExit) as bad_fmt:
+        main_mod.main(["--log-format", "xml"])
+    assert bad_fmt.value.code == 2
+
+    with pytest.raises(TypeError, match="string"):
+        resolve_log_level(123)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="log_format"):
+        configure_logging("INFO", log_format=123)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid --log-format"):
+        configure_logging("INFO", log_format="yaml")
+
+
+def test_main_verify_integrity_flag_and_logging_handler_creation(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(main_mod, "get_metrics_registry", MetricsRegistry)
+    db_path = tmp_path / "verify_cli.db"
+
+    with caplog.at_level(logging.INFO):
+        main_mod.main(["--db-path", str(db_path), "--verify-integrity"])
+
+    assert "Integrity check passed: blocks=9, schema_version=2" in caplog.text
+    assert "idx_applied_tx_ids_block_idx" in caplog.text
+
+    # Exercise StreamHandler creation when no root handlers exist.
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    root.handlers.clear()
+    try:
+        assert configure_logging("WARNING", log_format="json") == logging.WARNING
+        assert len(root.handlers) == 1
+        record = logging.LogRecord("demo", logging.WARNING, __file__, 1, "boom", (), None)
+        parsed = json.loads(root.handlers[0].format(record))
+        assert parsed == {"level": "WARNING", "logger": "demo", "message": "boom"}
+    finally:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        for h in saved_handlers:
+            root.addHandler(h)
+        root.setLevel(saved_level)

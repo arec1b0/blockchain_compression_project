@@ -83,14 +83,19 @@ verifiability back to genesis.
 4. To run the project using the command-line interface (CLI):
    ```bash
    uv run blockchain-compress
+   uv run blockchain-compress --max-full-blocks 4 --db-path ./data/chain.db --verify-integrity
+   uv run blockchain-compress --log-level DEBUG --log-format json
    ```
 
-5. To run the benchmarks:
+   Logging verbosity defaults to `INFO`, can be overridden via `BLOCKCHAIN_COMPRESSION_LOG_LEVEL`,
+   and gives CLI `--log-level` (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) precedence.
+
+5. To run the benchmarks (each accepts `--json`, `--output <path>`, `--log-level`, and workload flags):
    ```bash
-   uv run blockchain-compress-bench          # LZMA compression ratio and throughput
-   uv run blockchain-compress-bench-merkle   # Merkle proof length/latency vs. tree depth
-   uv run blockchain-compress-bench-pruning  # pruning latency/memory vs. chain length
-   uv run python -m blockchain_compression.benchmarks.scalability_benchmark  # full 4.x scalability suite
+   uv run blockchain-compress-bench --datasets synthetic-blocks repetitive --presets 1 6 --repeats 3
+   uv run blockchain-compress-bench-merkle --sizes 10 100 1000 --repeats 3 --json
+   uv run blockchain-compress-bench-pruning --chain-lengths 100 1000 --max-full-blocks 50 --json
+   uv run python -m blockchain_compression.benchmarks.scalability_benchmark --repeats 10 --json
    ```
 
 ---
@@ -214,6 +219,8 @@ blocks_added_total 8.0
   - **Durability trade-off**: `synchronous = NORMAL` skips per-commit `fsync` on WAL writes (fast appends, safe against OS/process crashes, though the most recent un-checkpointed WAL transaction can roll back on sudden power loss); pass `synchronous="FULL"` for strict per-commit power-loss durability.
   - **Deferred compaction**: Logical pruning (`prune_chain` / `mark_pruned`) leaves freed pages on SQLite's freelist. Call `store.compact()` (or pass `compact=True` to `prune_chain`) to run `PRAGMA incremental_vacuum` and `PRAGMA wal_checkpoint(TRUNCATE)`. `auto_vacuum = INCREMENTAL` activates automatically only on newly created databases; pre-existing databases with `auto_vacuum = NONE` (or databases dominated by small `<1 KiB` inline rows on non-empty leaf pages) require a one-time `store.compact(full=True)` (`VACUUM`) to rewrite and compact leaf pages, whereas multi-KiB overflow-paged block bodies shrink immediately under `incremental_vacuum`.
   - **Tip validation & incremental pruning**: `ChainStore._ensure_chain_persisted()` verifies persisted `COUNT(*)` and tip `(idx, hash)` on append (assuming mid-history SQLite rows are not altered externally between appends; full history and body verification remains available via `load_chain(validate=True)` / `chain.validate_chain()`). `BlockchainPruner` maintains `_next_unpruned_idx` so repeated prune passes avoid rescanning already-pruned prefixes.
+  - **Foreign-key / lookup indexes**: `ChainStore` creates `idx_applied_tx_ids_block_idx` on `applied_tx_ids(block_idx)` and (when the v2 `zk_attachments` table exists; skipped automatically on pre-v2 schemas lacking the table) `idx_zk_attachments_block_idx` on `zk_attachments(block_idx)`. These avoid full table scans on foreign-key checks and block-indexed lookups at the cost of a small B-tree write per inserted transaction ID or attachment.
+  - **Integrity diagnostics & read-only PRAGMA inspection**: `ChainStore.verify_integrity(check_bodies=True, verify_zk=False, raise_on_error=False)` runs SQLite `PRAGMA quick_check` plus `load_chain(validate=True)` and returns a structured `IntegrityReport` (`to_dict()` JSON-exportable). Because full validation decompresses and hashes stored block bodies, startup checks are disabled by default (`check_integrity_on_open=False`); run `verify_integrity()` (or pass `--verify-integrity` / `check_integrity_on_open=True`) after backup restores, crash recovery, or before critical migrations/exports. Safe read-only PRAGMA values are exposed publicly via `ChainStore.get_pragma(name)` and `ChainStore.get_pragmas()`.
   - **Bounded replay cache**: `ChainStore` defaults `max_cached_tx_ids = 10_000`, configuring an LRU cache on `StateDelta` backed by SQLite's indexed `applied_tx_ids(tx_id)` table (`has_applied_tx`). Pruning preserves `applied_tx_ids` so replay protection stays intact across pruning and restarts. Once the RAM cache overflows, checking unseen `tx_id`s requires the backing `ChainStore` to remain open (failing closed with `RuntimeError` if closed); pass `max_cached_tx_ids=None` to `load_chain()` / `ChainStore()` for detached in-memory operation.
 - **Metrics Cardinality & Thread Safety**:
   - `Chain.commit_block()` records constant-cardinality metrics (`blocks_added_total`, `block_raw_bytes_total`, `block_compressed_bytes_total`, `last_block_compression_ratio`, and the `block_compression_ratio` histogram) without unbounded per-block labels.

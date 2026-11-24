@@ -1,5 +1,9 @@
 # test_pruning_benchmark.py
 
+import json
+
+import pytest
+
 from blockchain_compression.benchmarks import pruning_benchmark as prune_bench
 from blockchain_compression.benchmarks.pruning_benchmark import _build_chain, benchmark_pruning
 from blockchain_compression.pruning import BlockchainPruner
@@ -37,7 +41,40 @@ def test_pruning_benchmark_run_and_main_fast(monkeypatch, caplog):
         ],
     )
     with caplog.at_level("INFO"):
-        prune_bench.main()
+        prune_bench.main([])
 
     assert "chain length" in caplog.text
     assert "freed KB" in caplog.text
+
+
+def test_pruning_benchmark_cli_json_parameters_and_errors(tmp_path, capsys):
+    prune_bench.main(["--chain-lengths", "12", "20", "--max-full-blocks", "4", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["benchmark"] == "pruning"
+    assert payload["parameters"] == {"chain_lengths": [12, 20], "max_full_blocks": 4}
+    assert [r["chain_length"] for r in payload["results"]] == [12, 20]
+    assert all(r["memory_freed_bytes"] > 0 for r in payload["results"])
+
+    out_file = tmp_path / "pruning.txt"
+    prune_bench.main(
+        [
+            "--chain-lengths",
+            "10",
+            "--max-full-blocks",
+            "3",
+            "--output",
+            str(out_file),
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert "chain length" in out_file.read_text(encoding="utf-8")
+
+    for bad_args in (
+        ["--chain-lengths", "0"],
+        ["--max-full-blocks", "0"],
+        ["--log-level", "BAD"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            prune_bench.main(bad_args)
+        assert exc.value.code == 2

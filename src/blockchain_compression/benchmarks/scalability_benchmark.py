@@ -17,6 +17,7 @@ Measures:
 Run with ``python -m blockchain_compression.benchmarks.scalability_benchmark``.
 """
 
+import argparse
 import gc
 import hashlib
 import logging
@@ -29,9 +30,15 @@ import tracemalloc
 from dataclasses import dataclass
 from pathlib import Path
 
+from blockchain_compression.benchmarks._cli import (
+    add_common_benchmark_args,
+    emit_benchmark_output,
+    format_json_payload,
+)
 from blockchain_compression.canonical import canonical_json
 from blockchain_compression.chain import Block, Chain
 from blockchain_compression.compression import FRAME_RAW, BlockCompressor
+from blockchain_compression.observability import configure_logging, resolve_log_level
 from blockchain_compression.persistence import ChainStore
 from blockchain_compression.pruning import BlockchainPruner
 from blockchain_compression.zk_proof import (
@@ -42,6 +49,20 @@ from blockchain_compression.zk_proof import (
 from blockchain_compression.zk_proof.groups import ZK_MODEXP_BACKEND
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_REPEATS = 50
+_DEFAULT_COMPRESSION_TX_COUNTS = (1, 50, 500)
+_DEFAULT_CHAIN_HEIGHTS = (100, 1000, 3000)
+_DEFAULT_SAMPLE_BLOCKS = 50
+_DEFAULT_PRUNE_HEIGHTS = (100, 1000, 3000)
+_DEFAULT_NOOP_HEIGHT = 1200
+_DEFAULT_NOOP_CALLS = 500
+_DEFAULT_SQLITE_BLOCKS = 300
+_DEFAULT_OVERFLOW_BLOCKS = 40
+_DEFAULT_OVERFLOW_TXS_PER_BLOCK = 100
+_DEFAULT_CACHE_PROBE_TXS = 2000
+_DEFAULT_CACHE_LIMIT = 100
+_DEFAULT_ZK_REPEATS = 5
 
 
 @dataclass(frozen=True)
@@ -387,7 +408,7 @@ def benchmark_sqlite_store(
             ov_before = overflow_db.stat().st_size
             ov_pruner = BlockchainPruner(ov_chain, max_full_blocks=2)
             store.prune_chain(ov_pruner)
-            ov_freelist = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
+            ov_freelist = int(store.get_pragma("freelist_count"))
             ov_after_prune = overflow_db.stat().st_size
             store.compact()
             ov_after_compact = overflow_db.stat().st_size
@@ -448,108 +469,391 @@ def benchmark_zk(repeats: int = 5) -> ZKBenchResult:
     )
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    logger.info(
-        "ENV: Python %s, SQLite %s, OS %s, CPU %s",
-        sys.version.split()[0],
-        sqlite3.sqlite_version,
-        platform.platform(),
-        platform.processor(),
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="blockchain-compress-scalability-bench",
+        description="Run the end-to-end performance and scalability benchmark suite.",
     )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=_DEFAULT_REPEATS,
+        help="Timing repetitions for serialization (and default for compression).",
+    )
+    parser.add_argument(
+        "--compression-tx-counts",
+        nargs="+",
+        type=int,
+        default=list(_DEFAULT_COMPRESSION_TX_COUNTS),
+        help="Transaction counts per block for serialization and compression benchmarks.",
+    )
+    parser.add_argument(
+        "--compression-repeats",
+        type=int,
+        default=None,
+        help="Override repetition count for block compression benchmarks.",
+    )
+    parser.add_argument(
+        "--chain-heights",
+        nargs="+",
+        type=int,
+        default=list(_DEFAULT_CHAIN_HEIGHTS),
+        help="Strictly ascending chain heights to sample append latency and RAM.",
+    )
+    parser.add_argument(
+        "--sample-blocks",
+        type=int,
+        default=_DEFAULT_SAMPLE_BLOCKS,
+        help="Number of recent blocks timed at each height in --chain-heights.",
+    )
+    parser.add_argument(
+        "--prune-heights",
+        nargs="+",
+        type=int,
+        default=list(_DEFAULT_PRUNE_HEIGHTS),
+        help="Strictly ascending chain heights to measure incremental pruning.",
+    )
+    parser.add_argument(
+        "--noop-height",
+        type=int,
+        default=_DEFAULT_NOOP_HEIGHT,
+        help="Chain height for idempotent no-op prune() microbenchmark.",
+    )
+    parser.add_argument(
+        "--noop-calls",
+        type=int,
+        default=_DEFAULT_NOOP_CALLS,
+        help="Number of consecutive no-op prune() calls to average.",
+    )
+    parser.add_argument(
+        "--sqlite-blocks",
+        type=int,
+        default=_DEFAULT_SQLITE_BLOCKS,
+        help="Number of single-tx blocks persisted in the SQLite ChainStore benchmark.",
+    )
+    parser.add_argument(
+        "--overflow-blocks",
+        type=int,
+        default=_DEFAULT_OVERFLOW_BLOCKS,
+        help="Number of large multi-tx blocks used to benchmark freelist/incremental compaction.",
+    )
+    parser.add_argument(
+        "--overflow-txs-per-block",
+        type=int,
+        default=_DEFAULT_OVERFLOW_TXS_PER_BLOCK,
+        help="Transactions per overflow block in the SQLite compaction benchmark.",
+    )
+    parser.add_argument(
+        "--cache-probe-txs",
+        type=int,
+        default=_DEFAULT_CACHE_PROBE_TXS,
+        help="Transaction count used to compare unbounded vs bounded replay-cache RAM.",
+    )
+    parser.add_argument(
+        "--cache-limit",
+        type=int,
+        default=_DEFAULT_CACHE_LIMIT,
+        help="Bounded applied_tx_ids cache limit (>= 0) for the SQLite benchmark.",
+    )
+    parser.add_argument(
+        "--zk-repeats",
+        type=int,
+        default=_DEFAULT_ZK_REPEATS,
+        help="Repetitions for ZK proof generation and verification timing.",
+    )
+    add_common_benchmark_args(parser)
+    return parser
 
-    logger.info("\n=== 1. JSON Serialization (Double vs Single-Pass) ===")
-    for ser in benchmark_serialization():
-        logger.info(
-            "%-14s raw=%6dB | old=%.4fms new=%.4fms (speedup=%.2fx)",
-            ser.label,
-            ser.raw_bytes,
-            ser.old_ms,
-            ser.new_ms,
-            ser.old_ms / max(ser.new_ms, 1e-9),
+
+def _size_label(n_tx: int) -> str:
+    if n_tx == 1:
+        return "small(1tx)"
+    if n_tx == 50:
+        return "medium(50tx)"
+    if n_tx == 500:
+        return "large(500tx)"
+    return f"batch({n_tx}tx)"
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    positive_int_flags = [
+        ("--repeats", args.repeats),
+        ("--sample-blocks", args.sample_blocks),
+        ("--noop-height", args.noop_height),
+        ("--noop-calls", args.noop_calls),
+        ("--sqlite-blocks", args.sqlite_blocks),
+        ("--overflow-blocks", args.overflow_blocks),
+        ("--overflow-txs-per-block", args.overflow_txs_per_block),
+        ("--cache-probe-txs", args.cache_probe_txs),
+        ("--zk-repeats", args.zk_repeats),
+    ]
+    for flag, val in positive_int_flags:
+        if val < 1:
+            parser.error(f"{flag} must be at least 1")
+    if args.compression_repeats is not None and args.compression_repeats < 1:
+        parser.error("--compression-repeats must be at least 1")
+    if args.cache_limit < 0:
+        parser.error("--cache-limit must be at least 0")
+    if any(n < 1 for n in args.compression_tx_counts):
+        parser.error("--compression-tx-counts values must be at least 1")
+    if any(h < args.sample_blocks for h in args.chain_heights):
+        parser.error("--chain-heights values must be >= --sample-blocks")
+    if any(a >= b for a, b in zip(args.chain_heights, args.chain_heights[1:], strict=False)):
+        parser.error("--chain-heights values must be strictly ascending")
+    if any(h < 1 for h in args.prune_heights):
+        parser.error("--prune-heights values must be at least 1")
+    if any(a >= b for a, b in zip(args.prune_heights, args.prune_heights[1:], strict=False)):
+        parser.error("--prune-heights values must be strictly ascending")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _validate_args(parser, args)
+    try:
+        resolved_level = resolve_log_level(args.log_level)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+    configure_logging(resolved_level)
+
+    if args.repeats == _DEFAULT_REPEATS and args.compression_tx_counts == list(
+        _DEFAULT_COMPRESSION_TX_COUNTS
+    ):
+        ser_results = benchmark_serialization()
+    else:
+        ser_sizes = tuple((_size_label(n), n) for n in args.compression_tx_counts)
+        ser_results = benchmark_serialization(sizes=ser_sizes, repeats=args.repeats)
+
+    if (
+        args.compression_tx_counts == list(_DEFAULT_COMPRESSION_TX_COUNTS)
+        and args.compression_repeats is None
+        and args.repeats == _DEFAULT_REPEATS
+    ):
+        comp_results = benchmark_block_compression()
+    else:
+        comp_reps = (
+            args.compression_repeats if args.compression_repeats is not None else args.repeats
+        )
+        comp_sizes = tuple((_size_label(n), n, comp_reps) for n in args.compression_tx_counts)
+        comp_results = benchmark_block_compression(sizes=comp_sizes)
+
+    if (
+        args.chain_heights == list(_DEFAULT_CHAIN_HEIGHTS)
+        and args.sample_blocks == _DEFAULT_SAMPLE_BLOCKS
+    ):
+        append_results = benchmark_chain_append()
+    else:
+        append_results = benchmark_chain_append(
+            heights=tuple(args.chain_heights),
+            sample_blocks=args.sample_blocks,
         )
 
-    logger.info("\n=== 2. Block Compression & Framing ===")
-    for comp in benchmark_block_compression():
-        logger.info(
-            "%-13s preset=%d thresh=%3d frame=%-10s raw=%6dB stored=%6dB "
-            "ratio=%5.2fx create=%7.3fms decomp=%6.3fms cap_ok=%s",
-            comp.label,
-            comp.preset,
-            comp.min_compress_bytes,
-            comp.frame,
-            comp.raw_bytes,
-            comp.stored_bytes,
-            comp.ratio,
-            comp.create_ms,
-            comp.decompress_ms,
-            comp.bomb_cap_rejected,
+    if (
+        args.prune_heights == list(_DEFAULT_PRUNE_HEIGHTS)
+        and args.noop_height == _DEFAULT_NOOP_HEIGHT
+        and args.noop_calls == _DEFAULT_NOOP_CALLS
+    ):
+        pr = benchmark_incremental_pruning()
+    else:
+        pr = benchmark_incremental_pruning(
+            noop_height=args.noop_height,
+            noop_calls=args.noop_calls,
+            growth_heights=tuple(args.prune_heights),
         )
 
-    logger.info("\n=== 3. In-Memory Chain.add_block Scaling ===")
-    for app in benchmark_chain_append():
-        logger.info(
-            "height=%4d: %.3f ms/block | traced_mem=%.1f KiB",
-            app.height,
-            app.avg_ms_per_block,
-            app.traced_mem_kib,
+    if (
+        args.sqlite_blocks == _DEFAULT_SQLITE_BLOCKS
+        and args.overflow_blocks == _DEFAULT_OVERFLOW_BLOCKS
+        and args.overflow_txs_per_block == _DEFAULT_OVERFLOW_TXS_PER_BLOCK
+        and args.cache_probe_txs == _DEFAULT_CACHE_PROBE_TXS
+        and args.cache_limit == _DEFAULT_CACHE_LIMIT
+    ):
+        sr = benchmark_sqlite_store()
+    else:
+        sr = benchmark_sqlite_store(
+            num_blocks=args.sqlite_blocks,
+            overflow_blocks=args.overflow_blocks,
+            overflow_txs_per_block=args.overflow_txs_per_block,
+            cache_probe_txs=args.cache_probe_txs,
+            cache_limit=args.cache_limit,
         )
 
-    logger.info("\n=== 4. Incremental Pruning ===")
-    pr = benchmark_incremental_pruning()
+    zr = benchmark_zk() if args.zk_repeats == _DEFAULT_ZK_REPEATS else benchmark_zk(args.zk_repeats)
+
+    py_ver = sys.version.split()[0]
+    sqlite_ver = sqlite3.sqlite_version
+    os_name = platform.platform()
+    cpu_name = platform.processor()
+
+    if args.json:
+        payload: dict[str, object] = {
+            "benchmark": "scalability",
+            "environment": {
+                "python": py_ver,
+                "sqlite": sqlite_ver,
+                "os": os_name,
+                "cpu": cpu_name,
+            },
+            "parameters": {
+                "repeats": args.repeats,
+                "compression_tx_counts": args.compression_tx_counts,
+                "compression_repeats": args.compression_repeats,
+                "chain_heights": args.chain_heights,
+                "sample_blocks": args.sample_blocks,
+                "prune_heights": args.prune_heights,
+                "noop_height": args.noop_height,
+                "noop_calls": args.noop_calls,
+                "sqlite_blocks": args.sqlite_blocks,
+                "overflow_blocks": args.overflow_blocks,
+                "overflow_txs_per_block": args.overflow_txs_per_block,
+                "cache_probe_txs": args.cache_probe_txs,
+                "cache_limit": args.cache_limit,
+                "zk_repeats": args.zk_repeats,
+            },
+            "results": {
+                "serialization": [
+                    {
+                        "label": s.label,
+                        "num_txs": s.num_txs,
+                        "raw_bytes": s.raw_bytes,
+                        "old_ms": s.old_ms,
+                        "new_ms": s.new_ms,
+                        "speedup": s.old_ms / max(s.new_ms, 1e-9),
+                    }
+                    for s in ser_results
+                ],
+                "block_compression": [
+                    {
+                        "label": c.label,
+                        "num_txs": c.num_txs,
+                        "preset": c.preset,
+                        "min_compress_bytes": c.min_compress_bytes,
+                        "frame": c.frame,
+                        "raw_bytes": c.raw_bytes,
+                        "stored_bytes": c.stored_bytes,
+                        "ratio": c.ratio,
+                        "create_ms": c.create_ms,
+                        "decompress_ms": c.decompress_ms,
+                        "bomb_cap_rejected": c.bomb_cap_rejected,
+                    }
+                    for c in comp_results
+                ],
+                "chain_append": [
+                    {
+                        "height": a.height,
+                        "avg_ms_per_block": a.avg_ms_per_block,
+                        "traced_mem_kib": a.traced_mem_kib,
+                    }
+                    for a in append_results
+                ],
+                "incremental_pruning": {
+                    "height_growth_ms": [{"height": h, "ms": ms} for h, ms in pr.height_growth_ms],
+                    "noop_500_us": pr.noop_500_us,
+                    "noop_us_per_call": pr.noop_500_us,
+                },
+                "sqlite_store": {
+                    "num_blocks": sr.num_blocks,
+                    "append_seconds": sr.append_seconds,
+                    "blocks_per_sec": sr.blocks_per_sec,
+                    "prune_ms": sr.prune_ms,
+                    "size_before_bytes": sr.size_before_bytes,
+                    "size_after_prune_bytes": sr.size_after_prune_bytes,
+                    "size_after_inc_compact_bytes": sr.size_after_inc_compact_bytes,
+                    "size_after_full_compact_bytes": sr.size_after_full_compact_bytes,
+                    "reload_validate_ms": sr.reload_validate_ms,
+                    "overflow_before_bytes": sr.overflow_before_bytes,
+                    "overflow_after_prune_bytes": sr.overflow_after_prune_bytes,
+                    "overflow_after_compact_bytes": sr.overflow_after_compact_bytes,
+                    "overflow_freelist_after_prune": sr.overflow_freelist_after_prune,
+                    "unbounded_mem_kib": sr.unbounded_mem_kib,
+                    "bounded_mem_kib": sr.bounded_mem_kib,
+                    "bounded_cached_ids": sr.bounded_cached_ids,
+                    "bounded_replay_rejected": sr.bounded_replay_rejected,
+                },
+                "zk": {
+                    "backend": zr.backend,
+                    "repeats": zr.repeats,
+                    "gen_mean_ms": zr.gen_mean_ms,
+                    "gen_min_ms": zr.gen_min_ms,
+                    "gen_max_ms": zr.gen_max_ms,
+                    "ver_mean_ms": zr.ver_mean_ms,
+                    "ver_min_ms": zr.ver_min_ms,
+                    "ver_max_ms": zr.ver_max_ms,
+                },
+            },
+        }
+        emit_benchmark_output(
+            format_json_payload(payload),
+            as_json=True,
+            output_path=args.output,
+            target_logger=logger,
+        )
+        return
+
+    lines = [
+        f"ENV: Python {py_ver}, SQLite {sqlite_ver}, OS {os_name}, CPU {cpu_name}",
+        "",
+        "=== 1. JSON Serialization (Double vs Single-Pass) ===",
+    ]
+    for ser in ser_results:
+        lines.append(
+            f"{ser.label:<14} raw={ser.raw_bytes:6d}B | old={ser.old_ms:.4f}ms "
+            f"new={ser.new_ms:.4f}ms (speedup={ser.old_ms / max(ser.new_ms, 1e-9):.2f}x)"
+        )
+
+    lines.extend(["", "=== 2. Block Compression & Framing ==="])
+    for comp in comp_results:
+        lines.append(
+            f"{comp.label:<13} preset={comp.preset:d} thresh={comp.min_compress_bytes:3d} "
+            f"frame={comp.frame:<10} raw={comp.raw_bytes:6d}B stored={comp.stored_bytes:6d}B "
+            f"ratio={comp.ratio:5.2f}x create={comp.create_ms:7.3f}ms "
+            f"decomp={comp.decompress_ms:6.3f}ms cap_ok={comp.bomb_cap_rejected}"
+        )
+
+    lines.extend(["", "=== 3. In-Memory Chain.add_block Scaling ==="])
+    for app in append_results:
+        lines.append(
+            f"height={app.height:4d}: {app.avg_ms_per_block:.3f} ms/block | "
+            f"traced_mem={app.traced_mem_kib:.1f} KiB"
+        )
+
+    lines.extend(["", "=== 4. Incremental Pruning ==="])
     for height, ms in pr.height_growth_ms:
-        logger.info("growth_prune @height=%4d: %.3f ms", height, ms)
-    logger.info("500x idempotent prune() @height=1200: %.2f us/call", pr.noop_500_us)
-
-    logger.info("\n=== 5. SQLite ChainStore & Bounded Replay Cache ===")
-    sr = benchmark_sqlite_store()
-    logger.info(
-        "%d add_block: %.3fs (%.1f blk/s) | prune=%.2fms | reload+validate=%.2fms",
-        sr.num_blocks,
-        sr.append_seconds,
-        sr.blocks_per_sec,
-        sr.prune_ms,
-        sr.reload_validate_ms,
-    )
-    logger.info(
-        "small inline DB size: before=%dB after_prune=%dB after_inc=%dB after_full=%dB",
-        sr.size_before_bytes,
-        sr.size_after_prune_bytes,
-        sr.size_after_inc_compact_bytes,
-        sr.size_after_full_compact_bytes,
-    )
-    logger.info(
-        "overflow DB compaction: before=%dB after_prune=%dB (freelist=%d) after_compact=%dB",
-        sr.overflow_before_bytes,
-        sr.overflow_after_prune_bytes,
-        sr.overflow_freelist_after_prune,
-        sr.overflow_after_compact_bytes,
-    )
-    logger.info(
-        "2000-tx replay cache RAM: unbounded=%.1f KiB vs bounded(100)=%.1f KiB "
-        "(cached=%d, c-0_rejected=%s)",
-        sr.unbounded_mem_kib,
-        sr.bounded_mem_kib,
-        sr.bounded_cached_ids,
-        sr.bounded_replay_rejected,
+        lines.append(f"growth_prune @height={height:4d}: {ms:.3f} ms")
+    lines.append(
+        f"{args.noop_calls}x idempotent prune() @height={args.noop_height}: "
+        f"{pr.noop_500_us:.2f} us/call"
     )
 
-    logger.info("\n=== 6. ZK Throughput ===")
-    zr = benchmark_zk()
-    logger.info(
-        "backend=%s reps=%d | generate=%.2fms (min=%.2f, max=%.2f, %.1f ops/s) | "
-        "verify=%.2fms (min=%.2f, max=%.2f, %.1f ops/s)",
-        zr.backend,
-        zr.repeats,
-        zr.gen_mean_ms,
-        zr.gen_min_ms,
-        zr.gen_max_ms,
-        1000.0 / zr.gen_mean_ms,
-        zr.ver_mean_ms,
-        zr.ver_min_ms,
-        zr.ver_max_ms,
-        1000.0 / zr.ver_mean_ms,
+    lines.extend(
+        [
+            "",
+            "=== 5. SQLite ChainStore & Bounded Replay Cache ===",
+            f"{sr.num_blocks} add_block: {sr.append_seconds:.3f}s "
+            f"({sr.blocks_per_sec:.1f} blk/s) | "
+            f"prune={sr.prune_ms:.2f}ms | reload+validate={sr.reload_validate_ms:.2f}ms",
+            f"small inline DB size: before={sr.size_before_bytes}B "
+            f"after_prune={sr.size_after_prune_bytes}B "
+            f"after_inc={sr.size_after_inc_compact_bytes}B "
+            f"after_full={sr.size_after_full_compact_bytes}B",
+            f"overflow DB compaction: before={sr.overflow_before_bytes}B "
+            f"after_prune={sr.overflow_after_prune_bytes}B "
+            f"(freelist={sr.overflow_freelist_after_prune}) "
+            f"after_compact={sr.overflow_after_compact_bytes}B",
+            f"{args.cache_probe_txs}-tx replay cache RAM: "
+            f"unbounded={sr.unbounded_mem_kib:.1f} KiB vs "
+            f"bounded({sr.bounded_cached_ids})={sr.bounded_mem_kib:.1f} KiB "
+            f"(cached={sr.bounded_cached_ids}, c-0_rejected={sr.bounded_replay_rejected})",
+            "",
+            "=== 6. ZK Throughput ===",
+            f"backend={zr.backend} reps={zr.repeats} | "
+            f"generate={zr.gen_mean_ms:.2f}ms (min={zr.gen_min_ms:.2f}, max={zr.gen_max_ms:.2f}, "
+            f"{1000.0 / zr.gen_mean_ms:.1f} ops/s) | "
+            f"verify={zr.ver_mean_ms:.2f}ms (min={zr.ver_min_ms:.2f}, max={zr.ver_max_ms:.2f}, "
+            f"{1000.0 / zr.ver_mean_ms:.1f} ops/s)",
+        ]
     )
+    emit_benchmark_output(lines, as_json=False, output_path=args.output, target_logger=logger)
 
 
 if __name__ == "__main__":
